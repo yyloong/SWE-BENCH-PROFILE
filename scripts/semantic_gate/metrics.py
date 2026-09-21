@@ -57,6 +57,8 @@ def main():
     records=list(by_id.values())
     intervals=[]
     if args.run_dir:
+        if (Path(args.run_dir)/'invalid-experiment.json').exists():
+            raise SystemExit('This run is marked invalid and cannot be reported as evaluation data.')
         for file in (Path(args.run_dir)/'runs').glob('*/result.json'):
             data=json.loads(file.read_text())
             if data.get('agent_start') and data.get('agent_end'):

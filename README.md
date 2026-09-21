@@ -8,7 +8,7 @@
 | 分步骤准备、启动、运行、查看进度 | [`scripts/pro/pro_test.py`](scripts/pro/pro_test.py) |
 | 离线统计通过率、平均 TPS 和时间占比 | [`scripts/metrics/key_metrics.py`](scripts/metrics/key_metrics.py) |
 
-目录：[快速开始](#quickstart) · [参数与提示词](#options) · [环境与下载](#environment) · [目录与脚本](#scripts) · [单题执行流程](#workflow) · [手动操作](#manual) · [结果文件](#results) · [指标统计](#metrics) · [停止与恢复](#operations) · [验证与历史数据](#validation)
+目录：[快速开始](#quickstart) · [参数与提示词](#options) · [8B→27B 审核实验](#semantic-gate) · [环境与下载](#environment) · [目录与脚本](#scripts) · [单题执行流程](#workflow) · [手动操作](#manual) · [结果文件](#results) · [指标统计](#metrics) · [停止与恢复](#operations) · [验证与历史数据](#validation)
 
 以下命令均从 `/home/longyy/opencode/swe-bench-env` 执行。原来根目录的 Python 脚本已移到 `scripts/` 下，`./run_pro.sh` 用法不变。
 
@@ -70,6 +70,7 @@ python3 scripts/pro/pro_test.py status --output manual-runs/my-pro-01
 | `--context-file FILE` | 只选一道题时，追加该 Markdown 执行路径提示 |
 | `--context-dir DIR` | 多题提示目录，每题一个 `<完整 instance_id>.md`，与 context-file 互斥 |
 | `--environment-file FILE` | 分步入口使用的环境清单，默认 `.pro-env/environment.json`；一键入口会准备并注入清单 |
+| `--gateway-run-dir DIR` | 实验参数，仅用于分步 init：连接这个目录管理的 8B→27B 审核服务；一条任务队列 |
 
 一键入口另支持：
 
@@ -136,6 +137,104 @@ python3 scripts/pro/pro_test.py init --help
 ```
 
 公开集来自本地冻结 revision，不会自动更新到最新数据集。
+
+<a id="semantic-gate"></a>
+
+## 8B 生成、27B 审核的转接口实验
+
+代码在 [scripts/semantic_gate/](scripts/semantic_gate/)，不会改动冻结的 runner 模板。GPU 0–3 部署 Qwen3.8-27B（TP4、BF16、DFlash2、262144 上下文）；GPU 4–5 部署 Qwen3-8B（TP2、BF16、131072 上下文），GPU 6–7 留空。8B 使用固定 revision `b968826d9c46dd6066d109eabc6255188de91218`，通过 YaRN factor=4 扩展窗口；这与其原生短窗口配置有区别，依据 [Qwen3-8B 官方模型说明](https://huggingface.co/Qwen/Qwen3-8B)。
+
+```text
+OpenCode → 原有请求记录代理 → semantic gate :8002
+                              ├─ 历史超出 8B 容量 → 27B 压缩 → 8B 候选
+                              └─ 历史可容纳 → 8B 候选
+                                  ↓ 工具名、JSON Schema、完整性检查
+                              27B 使用完整原始历史审核，只生成 A/R
+                                  ├─ A → 返回候选，OpenCode 执行工具
+                                  └─ R/异常 → 27B 用原始请求生成 → 返回
+```
+
+8B 默认关闭 thinking，最多生成 2048 token；27B 审核关闭 thinking，并限制为 A/R 的结构化选择、最多 2 token（含结束标记）。审核 prompt 在 [bootstrap/semantic-gate-review.txt](bootstrap/semantic-gate-review.txt)，重点是调用是否为有依据且符合约束的下一步，不要求与 27B 自己会选择的动作完全相同。一次输出的多个工具调用整批接受或拒绝；审核过程不实际执行工具。候选不完整、工具格式错误、审核超时或异常均回退。最终文字答复、标题及其他无工具请求直接使用 27B。
+
+长历史先交给 27B，使用 [压缩 prompt](bootstrap/semantic-gate-compress.txt) 生成工作记忆，仅供 8B 使用。保留原始系统约束、首个用户任务，并尽量保留近期完整工具轮次；若仍放不下，扩大压缩范围。压缩后仍超过容量或压缩未完成则回退。**27B 审核和回退生成始终使用原始完整历史**。同一会话只有在历史前缀完全匹配时才复用已有摘要，避免每轮重复压缩。这个代理内部压缩与 OpenCode 自身的 compaction 分开记录。
+
+这属于语义审核，不能保证与纯 27B 无损等价；接受率不能代替 SWE 官方通过率。能否加速取决于节省的 27B 生成时间是否大于 8B 生成、审核、压缩和失败回退的额外成本。
+
+### 启动和检查服务
+
+宿主依赖和模型缓存已经准备好时：
+
+```bash
+python3 scripts/semantic_gate/services.py start \
+  --output manual-runs/semantic-gate-20260921
+python3 scripts/semantic_gate/services.py status \
+  --output manual-runs/semantic-gate-20260921
+```
+
+实际端口为：27B `8000`、8B `8001`、转接口 `8002`；OpenCode 的模型 baseURL 使用 `http://127.0.0.1:8002/v1`。现有 Pro 容器通过原请求记录代理访问转接口，因此隔离网络和 Git 清理流程保留。服务控制脚本会检查 GPU/端口占用，只管理记录了 PID 和进程启动标识的本次服务。start 返回不等于加载完成，应等待三项 health 都通过。
+
+评测工作区位于 OpenCode 源码目录下时，新初始化的 runner 会用空的只读 tmpfs 屏蔽容器内 `/opencode/swe-bench-env`，并在启动模型前确认目录为空，避免源码挂载把题库、评分资料和历史运行一起暴露给 agent。旧运行目录若缺少这项隔离会被拒绝，需重新 init。首轮 `ansible-pilot` 因发现这个挂载问题已终止并标为无效；有效试跑使用 `ansible-pilot-isolated`，不可混用。
+
+8B 不在缓存时可先下载；代理沿用已有设置，关闭遗留 SOCKS 环境变量以免影响 HTTP 下载：
+
+```bash
+env -u ALL_PROXY -u all_proxy HF_HUB_DISABLE_XET=1 \
+  HTTP_PROXY=http://ubuntu-lab.zinyy.tech:20172 \
+  HTTPS_PROXY=http://ubuntu-lab.zinyy.tech:20172 \
+  http_proxy=http://ubuntu-lab.zinyy.tech:20172 \
+  https_proxy=http://ubuntu-lab.zinyy.tech:20172 \
+  /home/longyy/anaconda3/envs/vllm/bin/python -c \
+  'from huggingface_hub import snapshot_download; snapshot_download("Qwen/Qwen3-8B", revision="b968826d9c46dd6066d109eabc6255188de91218", allow_patterns=["*.json", "*.safetensors", "*.jinja", "*.txt"], max_workers=4)'
+```
+
+### 使用标准 Pro 流程测试
+
+下面选择 fixed10 第 4 题，不加逐题路径提示，保留默认通用 subagent 鼓励语。每次实验使用新目录；也可以修改 indices，或去掉 indices 跑 fixed10。两个模型共同服务一条题目队列，题内 subagent 请求允许并发。
+
+```bash
+python3 scripts/pro/pro_test.py init \
+  --output manual-runs/my-gated-pro \
+  --cohort fixed10 --indices 4 \
+  --gateway-run-dir manual-runs/semantic-gate-20260921
+
+sg docker -c 'python3 scripts/pro/pro_test.py doctor --output manual-runs/my-gated-pro'
+sg docker -c 'python3 scripts/pro/pro_test.py pull --output manual-runs/my-gated-pro'
+sg docker -c 'python3 scripts/pro/pro_test.py run --output manual-runs/my-gated-pro'
+```
+
+此模式不执行 pro_test.py serve 或 run_pro.sh；它们负责普通评测服务。转接口由上述 services.py 单独管理，求解结束后服务保持运行。停止前先让任务结束；停止和只重启转接口的命令如下：
+
+```bash
+python3 scripts/semantic_gate/services.py stop --output manual-runs/semantic-gate-20260921
+# 改了转接口代码或 prompt 后，等待当前任务结束，再仅重启它：
+python3 scripts/semantic_gate/services.py restart-proxy --output manual-runs/semantic-gate-20260921
+```
+
+### 日志、口径和验证
+
+| 文件或脚本 | 用途 |
+|---|---|
+| services.json、server-27b/8b.json、proxy.json | 模型配置、GPU、端口和本次进程身份 |
+| server-27b.log、server-8b.log、proxy.log | 模型与转接口日志 |
+| gateway-logs/requests.jsonl | 每个请求的候选、路由、审核结果、压缩及各物理阶段 usage/服务端时长 |
+| [scripts/semantic_gate/metrics.py](scripts/semantic_gate/metrics.py) | 从物理调用统计候选接受率、审核/压缩成本、各模型 tokens 和 decode TPS |
+| [scripts/semantic_gate/probe.py](scripts/semantic_gate/probe.py) | 可控正反例、短请求配对计时、可选超长上下文压缩检查；不等同于 SWE 通过率测试 |
+
+```bash
+python3 scripts/semantic_gate/metrics.py \
+  manual-runs/semantic-gate-20260921/gateway-logs \
+  --run-dir manual-runs/my-gated-pro \
+  --output-dir manual-runs/my-gated-pro/metrics-output
+
+/home/longyy/anaconda3/envs/vllm/bin/python scripts/semantic_gate/probe.py \
+  --output manual-runs/semantic-gate-probe --long-context
+
+/home/longyy/anaconda3/envs/vllm/bin/python -m unittest tests.test_semantic_gate -v
+```
+
+有 gateway 配置的 Pro 运行结束时会自动生成 gateway-metrics.md/json。独立统计省略 run-dir 会统计该服务日志中的全部请求；指定 run-dir 按已结束任务的 agent 时间区间筛选，测试时不要让无关实验同时使用同一服务。
+
+接受的候选在审核前不会传给 OpenCode；审核后集中发送 SSE，不能把发送速度当 decode TPS。返回 usage 为原始历史在 27B tokenizer 下的输入计数，加上候选序列化后的输出计数估计，用于维持 OpenCode 的上下文预算；8B、审核、压缩的实际物理 tokens 都在分阶段日志里。gateway-metrics 使用真实后端 generation_time_ms；时间占比先按每个 API 请求等待时间计算，再平均，不包含工具执行。标准 key-metrics 的模型阶段列不能覆盖这个实验全部内部开销，报告会提示使用 gateway-metrics；整题墙钟、工具事件和官方评分仍由原 harness 记录。250 次预算仍按 OpenCode 逻辑请求计数，新增物理请求另外统计。
 
 <a id="environment"></a>
 
@@ -293,7 +392,7 @@ flowchart LR
 
 1. 根据 `instance_id` 找到公开题面、base commit、对应镜像标签。
 2. 检查或下载 `jefzda/sweap-images:<dockerhub_tag>`。
-3. 创建 8 CPU / 32 GiB 解题容器，限制网络，清理未来 Git 元数据，保留 base 及祖先。
+3. 创建 8 CPU / 32 GiB 解题容器，限制网络，清理未来 Git 元数据，保留 base 及祖先；若评测目录在 OpenCode checkout 下，额外屏蔽其容器挂载路径并确认不可读。
 4. 以官方格式生成题面，加上通用 prompt 和可选 Markdown context，启动 OpenCode。
 5. OpenCode 经请求代理访问专属 vLLM server；插件记录工具和 session 事件。每个 server 同时只运行一道任务，题内 helper 可以并发。
 6. OpenCode 退出后提取它自行生成的 patch，结束 agent 计时。

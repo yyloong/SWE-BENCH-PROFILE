@@ -74,6 +74,8 @@ class WorkflowTests(unittest.TestCase):
             self.invoke('init','--output',str(output),'--indices','4','--gateway-run-dir',str(service))
             self.assertEqual(pro_test.read(output/'config.json')['gateway_run_dir'],str(service))
             self.assertIn("'--upstream','http://127.0.0.1:8002'",(output/'runner.py').read_text())
+            self.assertIn("'--tmpfs','/opencode/swe-bench-env:ro,nosuid,nodev,noexec,size=1m'",(output/'runner.py').read_text())
+            self.assertIn("Benchmark workspace is visible",(output/'runner.py').read_text())
             self.assertIn("'--upstream',f'http://127.0.0.1:{port}'",(pro_test.ROOT/'bootstrap/templates/runner.py').read_text())
             with self.assertRaisesRegex(RuntimeError,'semantic gate'):
                 pro_test.serve(output)
@@ -90,6 +92,13 @@ class WorkflowTests(unittest.TestCase):
                  subprocess.CompletedProcess([],0,'GPU-a, 12345\n')]
         with patch.object(pro_test,'command',side_effect=results):
             with self.assertRaisesRegex(RuntimeError,'already have compute'):pro_test.gpu_guard(dict(ports=[8000],gpus=[[0,1,2,3]]))
+
+    def test_old_run_without_workspace_mask_is_rejected_before_launch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p=Path(temp)
+            pro_test.save(p/'config.json',dict(opencode_root=str(pro_test.ROOT.parent)))
+            with self.assertRaisesRegex(RuntimeError,'Reinitialize'):
+                pro_test.checks(p)
 
     def test_status_stops_agent_clock_during_grade(self):
         with tempfile.TemporaryDirectory() as temp:

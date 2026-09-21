@@ -137,6 +137,26 @@ def init(args):
         'http://ubuntu-lab.zinyy.tech:20172': environment['proxy'],
     }.items():
         source = source.replace(old, new)
+    # The evaluator may live inside the OpenCode checkout. Its raw task rows,
+    # grading files and other runs must not ride along with the harness mount.
+    workspace_mask = None
+    try:
+        relative_workspace = ROOT.relative_to(Path(environment['opencode_root']).resolve())
+    except ValueError:
+        relative_workspace = None
+    if relative_workspace is not None:
+        if str(relative_workspace) == '.':
+            raise ValueError('Evaluator workspace cannot be the OpenCode checkout root')
+        workspace_mask = '/opencode/'+relative_workspace.as_posix()
+        anchor = "   (td/'observation').mkdir(exist_ok=True);run(args,check=True,capture_output=True)"
+        if source.count(anchor) != 1 or source.count('   baseline=dex(') != 1:
+            raise ValueError('Inspect benchmark-workspace isolation adaptation in runner')
+        source = source.replace(anchor,
+            f"   args[args.index(image):args.index(image)]=['--tmpfs',{workspace_mask+':ro,nosuid,nodev,noexec,size=1m'!r}]\n"+anchor)
+        audit = f"   hidden=dex(name,'find '+shlex.quote({workspace_mask!r})+' -mindepth 1 -print -quit',capture_output=True)\n"
+        audit += "   if hidden.returncode or hidden.stdout.strip():raise RuntimeError('Benchmark workspace is visible in the agent container')\n"
+        audit += f"   result['benchmark_workspace_mask']={{'path':{workspace_mask!r},'empty':True}}\n"
+        source = source.replace('   baseline=dex(',audit+'   baseline=dex(')
     compile(source, 'generated-runner.py', 'exec')
     p.mkdir(parents=True)
     for name in ['assets', 'infra-fix']:
@@ -168,6 +188,7 @@ def init(args):
         template_source=str(template), mutable_docker_images_shared=False)
     config.update({k:environment[k] for k in ['python','official_root','opencode_root']})
     config.update(environment=environment)
+    config['benchmark_workspace_mask'] = workspace_mask
     if gateway:
         config.update(gateway_run_dir=str(gateway_path), gateway_url=gateway['gateway_url'])
     save(p/'config.json', config)
@@ -189,6 +210,12 @@ def image_ready(d):
 
 def checks(p, require_images=False):
     cfg = read(p/'config.json')
+    try:
+        relative_workspace = ROOT.relative_to(Path(cfg['opencode_root']).resolve())
+    except ValueError:
+        relative_workspace = None
+    if relative_workspace is not None and cfg.get('benchmark_workspace_mask') != '/opencode/'+relative_workspace.as_posix():
+        raise RuntimeError('Reinitialize in a new directory: this run lacks the benchmark-workspace mount isolation.')
     command(['docker','info'],capture_output=True)
     for f in [Path(cfg['python']),Path(cfg['official_root'])/'swe_bench_pro_eval.py',Path(cfg['opencode_root'])/'packages/opencode/src/index.ts',p/'assets/config',p/'infra-fix/sanitize-git.sh',p/'infra-fix/bun-linux-x64-musl/bun',p/'assets/ripgrep-15.1.0-x86_64-unknown-linux-musl/rg']:
         if not f.exists():raise RuntimeError(f'Missing local dependency: {f}')
@@ -275,6 +302,8 @@ def verify_servers(p):
         urllib.request.urlopen(f'http://127.0.0.1:{port}/health',timeout=5).close()
 
 def metrics(p):
+    if (p/'invalid-experiment.json').exists():
+        raise RuntimeError('This run is marked invalid; do not include it in evaluation metrics.')
     python=read(p/'config.json')['python'] if (p/'config.json').exists() else PYTHON
     if (p/'efficiency_metrics.py').exists():
         command([python,str(p/'efficiency_metrics.py'),str(p),'--output-dir',str(p/'metrics-output')], stdout=subprocess.DEVNULL)
@@ -320,6 +349,9 @@ def run(p):
         print('Run ended. Model services remain in the serve terminal; stop them with Ctrl-C when finished.')
 
 def status(p):
+    if (p/'invalid-experiment.json').exists():
+        print(json.dumps(read(p/'invalid-experiment.json'),ensure_ascii=False,indent=2))
+        return
     rows=[]
     for d in read(p/'selected.json'):
         td=p/'runs'/d['instance_id'];r=read(td/'result.json') if (td/'result.json').exists() else {}
