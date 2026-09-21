@@ -1,0 +1,119 @@
+{
+  "estimation": "Keep each Codex task output token workload; apply the corresponding Qwen no-path baseline task parent-level decode TPS. Per-request first output token excluded, matching the TPS definition. Native tokenizer counts treated as approximately comparable; no prefill or wall-clock overlap reconstruction.",
+  "qwen_reference": "pro-path-context-20260917/arms/baseline (not the older pro-general-full run)",
+  "mean_assumed_decode_tps": 67.0977817816786,
+  "mean_estimated_decode_seconds": 102.2845218251808,
+  "estimated_decode_seconds_sum": 1022.8452182518079,
+  "rows": [
+    {
+      "index": 1,
+      "instance_id": "instance_future-architect__vuls-fd18df1dd4e4360f8932bc4b894bd8b40d654e7c",
+      "qwen_baseline_parent_decode_tps": 124.46908007351477,
+      "codex_output_tokens": 5859,
+      "codex_requests_with_output": 11,
+      "codex_decode_tokens_after_first": 5848,
+      "estimated_decode_seconds": 46.98355604898835,
+      "codex_observed_wall_seconds": 216.412,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/typical/summary.json"
+    },
+    {
+      "index": 2,
+      "instance_id": "instance_tutao__tutanota-de49d486feef842101506adf040a0f00ded59519-v10a26bfb45a064b93f4fc044a0254925037b88f1",
+      "qwen_baseline_parent_decode_tps": 55.427432495781815,
+      "codex_output_tokens": 5455,
+      "codex_requests_with_output": 23,
+      "codex_decode_tokens_after_first": 5432,
+      "estimated_decode_seconds": 98.0020137215158,
+      "codex_observed_wall_seconds": 286.814,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/02/summary.json"
+    },
+    {
+      "index": 3,
+      "instance_id": "instance_flipt-io__flipt-b22f5f02e40b225b6b93fff472914973422e97c6",
+      "qwen_baseline_parent_decode_tps": 72.84339595858368,
+      "codex_output_tokens": 9099,
+      "codex_requests_with_output": 13,
+      "codex_decode_tokens_after_first": 9086,
+      "estimated_decode_seconds": 124.73333897236196,
+      "codex_observed_wall_seconds": 335.952,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/03/summary.json"
+    },
+    {
+      "index": 4,
+      "instance_id": "instance_ansible__ansible-3b823d908e8a5d17674f8c26d337d3114b7493b1-v0f01c69f1e2528b935359cfe578530722bca2c59",
+      "qwen_baseline_parent_decode_tps": 62.92935590157002,
+      "codex_output_tokens": 4645,
+      "codex_requests_with_output": 8,
+      "codex_decode_tokens_after_first": 4637,
+      "estimated_decode_seconds": 73.68580106322544,
+      "codex_observed_wall_seconds": 164.365,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/04/summary.json"
+    },
+    {
+      "index": 5,
+      "instance_id": "instance_protonmail__webclients-8be4f6cb9380fcd2e67bcb18cef931ae0d4b869c",
+      "qwen_baseline_parent_decode_tps": 55.39876359705275,
+      "codex_output_tokens": 9842,
+      "codex_requests_with_output": 16,
+      "codex_decode_tokens_after_first": 9826,
+      "estimated_decode_seconds": 177.36857940495173,
+      "codex_observed_wall_seconds": 355.813,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/05/summary.json"
+    },
+    {
+      "index": 6,
+      "instance_id": "instance_gravitational__teleport-ac2fb2f9b4fd1896b554d3011df23d3d71295779",
+      "qwen_baseline_parent_decode_tps": 70.67299261319276,
+      "codex_output_tokens": 4849,
+      "codex_requests_with_output": 12,
+      "codex_decode_tokens_after_first": 4837,
+      "estimated_decode_seconds": 68.4419864101957,
+      "codex_observed_wall_seconds": 199.048,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/06/summary.json"
+    },
+    {
+      "index": 7,
+      "instance_id": "instance_flipt-io__flipt-7161f7b876773a911afdd804b281e52681cb7321",
+      "qwen_baseline_parent_decode_tps": 57.72526631900697,
+      "codex_output_tokens": 4654,
+      "codex_requests_with_output": 20,
+      "codex_decode_tokens_after_first": 4634,
+      "estimated_decode_seconds": 80.27680590317486,
+      "codex_observed_wall_seconds": 236.992,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/07/summary.json"
+    },
+    {
+      "index": 8,
+      "instance_id": "instance_element-hq__element-web-494d9de6f0a94ffb491e74744d2735bce02dc0ab-vnan",
+      "qwen_baseline_parent_decode_tps": 45.183122491750915,
+      "codex_output_tokens": 4041,
+      "codex_requests_with_output": 14,
+      "codex_decode_tokens_after_first": 4027,
+      "estimated_decode_seconds": 89.12619973830294,
+      "codex_observed_wall_seconds": 175.815,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/08/summary.json"
+    },
+    {
+      "index": 9,
+      "instance_id": "instance_gravitational__teleport-65438e6e44b6ce51458d09b7bb028a2797cfb0ea-vce94f93ad1030e3136852817f2423c1b3ac37bc4",
+      "qwen_baseline_parent_decode_tps": 60.18111828732035,
+      "codex_output_tokens": 9408,
+      "codex_requests_with_output": 18,
+      "codex_decode_tokens_after_first": 9390,
+      "estimated_decode_seconds": 156.02900489767723,
+      "codex_observed_wall_seconds": 396.283,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/09/summary.json"
+    },
+    {
+      "index": 10,
+      "instance_id": "instance_protonmail__webclients-7e54526774e577c0ebb58ced7ba8bef349a69fec",
+      "qwen_baseline_parent_decode_tps": 66.14729007901198,
+      "codex_output_tokens": 7175,
+      "codex_requests_with_output": 18,
+      "codex_decode_tokens_after_first": 7157,
+      "estimated_decode_seconds": 108.19793209141397,
+      "codex_observed_wall_seconds": 306.693,
+      "codex_summary_path": "/home/longyy/swe-bench-env/subagent-speed-20260917/batch10/tasks/10/summary.json"
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "local-qwen/qwen3.8-27b",
+  "provider": {
+    "local-qwen": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local Qwen",
+      "options": {
+        "baseURL": "http://172.18.0.1:8000/v1"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen3.8 27B",
+          "reasoning": true,
+          "interleaved": {
+            "field": "reasoning"
+          },
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        }
+      }
+    }
+  },
+  "permission": {
+    "*": "allow",
+    "webfetch": "deny",
+    "websearch": "deny"
+  }
+}

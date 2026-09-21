@@ -1,0 +1,96 @@
+{
+  "schema_version": 2,
+  "averaging": "arithmetic mean over tasks; task TPS uses matched token/time sums; tool parallel bound percentage is a ratio of means",
+  "scope": "parent model including title/compaction; child lifespans folded into subagent tools",
+  "attribution": "exclusive leaf categories; all cross-category overlaps and unknown time in other",
+  "phase_estimation": "server durations aligned to proxy request end; reasoning split estimated from stream boundaries",
+  "tool_parallel_bound_definition": "U = union of all parent tool jobs, including opaque child lifespans and wrappers; L = longest job duration after within-job union; reduction upper bound = U - L. Fixed observed durations, no dependencies or resource limits. Percentage = mean(U-L)/mean(U), not mean((U-L)/U).",
+  "prefill_field": "time_to_first_token_ms",
+  "exclude_censored": false,
+  "groups": {
+    "baseline": {
+      "input": "/home/longyy/swe-bench-env/pro-path-context-20260917/arms/baseline",
+      "tasks": 10,
+      "tps_tasks": 10,
+      "excluded": {},
+      "graded_tasks": 10,
+      "passed": 9,
+      "pass_rate_percent": 90.0,
+      "mean_wall_seconds": 1106.6151362895966,
+      "mean_decode_tps": 67.0977817816786,
+      "mean_seconds": {
+        "reasoning": 615.3712940931321,
+        "non_reasoning": 146.93810706138612,
+        "prefill": 54.144984292984006,
+        "ordinary_tool": 184.37901859283448,
+        "subagent": 45.222646951675415,
+        "other": 60.55908529758453,
+        "decode": 762.3094011545181,
+        "tools": 229.6016655445099
+      },
+      "mean_percent": {
+        "reasoning": 53.587150329797396,
+        "non_reasoning": 12.792831140089328,
+        "prefill": 3.9743516128846625,
+        "ordinary_tool": 18.229728447903042,
+        "subagent": 4.033535777646547,
+        "other": 7.3824026916790215,
+        "decode": 66.37998146988673,
+        "tools": 22.26326422554959
+      },
+      "quality": {
+        "parent_requests": 716,
+        "tps_matched_requests": 716,
+        "prefill_timed_requests": 716
+      },
+      "tool_parallel_bound": {
+        "mean_tool_union_seconds": 249.27269744873047,
+        "mean_ideal_lower_bound_seconds": 107.48299827575684,
+        "mean_maximum_reduction_seconds": 141.78969917297363,
+        "maximum_reduction_percent_of_mean_tool_union": 56.88135950072769
+      }
+    },
+    "path": {
+      "input": "/home/longyy/swe-bench-env/pro-path-context-20260917/arms/path",
+      "tasks": 10,
+      "tps_tasks": 10,
+      "excluded": {},
+      "graded_tasks": 10,
+      "passed": 8,
+      "pass_rate_percent": 80.0,
+      "mean_wall_seconds": 846.3448062896729,
+      "mean_decode_tps": 69.78397546695695,
+      "mean_seconds": {
+        "reasoning": 473.0144018650055,
+        "non_reasoning": 123.68790676593781,
+        "prefill": 27.059852838516235,
+        "ordinary_tool": 171.18949224948884,
+        "subagent": 6.410185551643371,
+        "other": 44.982967019081116,
+        "decode": 596.7023086309433,
+        "tools": 177.5996778011322
+      },
+      "mean_percent": {
+        "reasoning": 57.7756031308086,
+        "non_reasoning": 14.938694866856554,
+        "prefill": 3.3150597656794734,
+        "ordinary_tool": 18.60931445520872,
+        "subagent": 0.5537175527330723,
+        "other": 4.807610228713578,
+        "decode": 72.71429799766516,
+        "tools": 19.163032007941794
+      },
+      "quality": {
+        "parent_requests": 448,
+        "tps_matched_requests": 448,
+        "prefill_timed_requests": 448
+      },
+      "tool_parallel_bound": {
+        "mean_tool_union_seconds": 193.67700486183168,
+        "mean_ideal_lower_bound_seconds": 70.98378822803497,
+        "mean_maximum_reduction_seconds": 122.6932166337967,
+        "maximum_reduction_percent_of_mean_tool_union": 63.34939799452469
+      }
+    }
+  }
+}

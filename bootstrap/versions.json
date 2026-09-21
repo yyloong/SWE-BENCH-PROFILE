@@ -1,0 +1,39 @@
+{
+  "opencode_commit": "193de13a88d62a6409c6d385831180f1def527dc",
+  "official_commit": "ca10a60a5fcae51e6948ffe1485d4153d421e6c5",
+  "dataset_revision": "7ab5114912baf22bb098818e604c02fe7ad2c11f",
+  "model": {
+    "repo": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  "draft": {
+    "repo": "incoai/Qwen3.8-27B-DFlash2",
+    "revision": "dedf8df68adfb1afeaf7b7480c0a0243108177b4"
+  },
+  "bun_version": "1.4.2",
+  "bun_sha256": "a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c",
+  "bun_musl_sha256": "16b72935ffd7a503b978c186874539c92aade4e3515b70a5abf5db2581fdef7d",
+  "rg_sha256": "ebeaf56f8a25e102e9419933423738b3a2a613a444fd749d695e15eba53f71f2",
+  "vllm_version": "0.29.0",
+  "torch_version": "2.13.0",
+  "transformers_version": "5.17.0",
+  "templates": {
+    "requirements-eval.txt": "004f76dfe22c1ebe3ef38af2b8d0f207900762b267e7093db45ef25f5783fd3b",
+    "requirements-vllm.txt": "9539e1382f1b63195699f2db3180be3f0f2ac9336db8f745b30ea78a775e6912",
+    "templates/server-argv.json": "cf452cf949f8f8f1ea890dcace07a72eebb68dd60387312bee4bcee244a2d57f",
+    "templates/plugin-package-lock.json": "1c5fc4173a0cb9c1556e796e4397807a2084c3a8e582667456be98e81f2cbc79",
+    "templates/trace_proxy.py": "ae5e6f6e38b5304072f580122a204f13737f4257a0b39a2ae9330fc24a725809",
+    "templates/registries.conf": "ec865a599049720379ebd5b1bcc5a7ad31a341fe624f1e42ac6f98a5b5d0575e",
+    "templates/runner.py": "d1a8e13551a575c4ff78324fe92d87a81d7902623793ea22f570b7867dc097cc",
+    "templates/fixed10.json": "86428b0e0c65014e49c89b81ec26439195b9bf024b4747cb86a65fa199e86a4b",
+    "templates/analyze.py": "caf9aa51165cc99ba7a63826c4ea52676c0e7f1f41bcc301275538160d1bfb7f",
+    "templates/plugin-package.json": "4fb596dfe39681a842436893b0906fab3714420dc170a213da6745652470c8f1",
+    "templates/efficiency_metrics.py": "1260acac69a17bc99211dc8f1026bc931f74fa538c98bb5ae926fb752a3f0045",
+    "templates/public.json.gz": "f1a7339645d70d177d6fad3e000cd6c5873a92b55870e70c94c30125860bcb8b",
+    "templates/sanitize-git.sh": "eee65d0391720468709b5059e5efb626806ae408541100d83abf55da3da50836",
+    "templates/trace-plugin.ts": "0aa0e87fd5cfda09cc8b4ffbd83a1d3e44bb40971d07701ac7a6de9150af7dcf",
+    "templates/pull_one.py": "8700adee9c5eafafde8156f2a0c0eb5bd67c8fb4182ddbc1d64343e181861153",
+    "templates/pull_images.py": "62a55c21643e33a5041411e509e8c3f25dfb9a2a07e1fd4a8a77d40d2cb45341",
+    "templates/delegation-prompt.txt": "ec8d9ed61bad7f156d003b3488df75196e3a8751f95f193c0ed9e56639f8a4ea"
+  }
+}
