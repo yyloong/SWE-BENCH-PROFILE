@@ -67,18 +67,25 @@ def start(args):
     if any(not (draft/name).exists() for name in set(index['weight_map'].values())):
         raise RuntimeError('Draft checkpoint download is incomplete')
     config = dict(target_url='http://127.0.0.1:8000', draft_url='http://127.0.0.1:8001',
-                  gateway_url='http://127.0.0.1:8002', target_gpus=[0,1,2,3], draft_gpus=[4,5],
+                  gateway_url='http://127.0.0.1:8002', target_gpus=[0,1,2,3], draft_gpus=list(range(4,4+args.draft_tp)),
                   target_model='qwen3.8-27b', draft_model='qwen3-8b',
                   target_context=262144, draft_context=args.draft_context,
-                  draft_path=str(draft), target_path=envinfo['model'])
+                  draft_tokens=args.draft_tokens,
+                  draft_path=str(draft), target_path=envinfo['model'],
+                  overlap_target=args.overlap_target, draft_thinking=args.draft_thinking)
     configfile = path/'services.json'
-    if configfile.exists() and json.loads(configfile.read_text()) != config:
-        raise RuntimeError('Use a new service directory to change model configuration')
+    if configfile.exists():
+        previous = json.loads(configfile.read_text())
+        previous.setdefault('overlap_target', False)
+        previous.setdefault('draft_thinking', False)
+        previous.setdefault('draft_tokens', 2048)
+        if previous != config:
+            raise RuntimeError('Use a new service directory to change model configuration')
     target = list(envinfo['server_argv'])
     target[target.index('--host')+1] = '127.0.0.1'
     small = [python, '-m', 'vllm.entrypoints.cli.main', 'serve', str(draft),
              '--host', '127.0.0.1', '--port', '8001', '--served-model-name', 'qwen3-8b',
-             '--tensor-parallel-size', '2', '--dtype', 'bfloat16', '--gpu-memory-utilization', '0.95',
+             '--tensor-parallel-size', str(args.draft_tp), '--dtype', 'bfloat16', '--gpu-memory-utilization', '0.95',
              '--max-model-len', str(args.draft_context), '--max-num-seqs', '8',
              '--max-num-batched-tokens', '8192', '--max-cudagraph-capture-size', '16',
              '--reasoning-parser', 'qwen3', '--enable-auto-tool-choice', '--tool-call-parser', 'hermes',
@@ -87,12 +94,17 @@ def start(args):
         small += ['--hf-overrides', json.dumps({'rope_scaling': {'rope_type':'yarn', 'factor':4.0,
                                                         'original_max_position_embeddings':32768}})]
     proxy = [python, str(ROOT/'scripts/semantic_gate/proxy.py'), '--port', '8002',
-             '--draft-context', str(args.draft_context), '--log-dir', str(path/'gateway-logs')]
+             '--draft-context', str(args.draft_context), '--draft-tokens', str(args.draft_tokens),
+             '--log-dir', str(path/'gateway-logs')]
+    if args.overlap_target:
+        proxy.append('--overlap-target')
+    if args.draft_thinking:
+        proxy.append('--draft-thinking')
     configfile.write_text(json.dumps(config, indent=2))
     started = []
     try:
         for name, argv, gpus, port in [('server-27b', target, [0,1,2,3], 8000),
-                                      ('server-8b', small, [4,5], 8001), ('proxy', proxy, [], 8002)]:
+                                      ('server-8b', small, config['draft_gpus'], 8001), ('proxy', proxy, [], 8002)]:
             recordfile = path/(name+'.json')
             if recordfile.exists() and alive(json.loads(recordfile.read_text())):
                 print(name+': already running', flush=True)
@@ -125,10 +137,33 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['start','status','stop','restart-proxy'])
     parser.add_argument('--output', required=True)
-    parser.add_argument('--draft-context', type=int, default=131072)
-    parser.add_argument('--draft-path', default='/home/longyy/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218')
+    parser.add_argument('--draft-context', type=int)
+    parser.add_argument('--draft-tp', type=int, choices=[1,2,4])
+    parser.add_argument('--draft-tokens', type=int, help='Total candidate output budget, including reasoning')
+    parser.add_argument('--overlap-target', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--draft-thinking', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--draft-path')
     args = parser.parse_args()
     path = Path(args.output).resolve()
+    previous = json.loads((path/'services.json').read_text()) if (path/'services.json').exists() else {}
+    defaults = dict(draft_context=previous.get('draft_context',131072),
+                    draft_tokens=previous.get('draft_tokens',2048),
+                    draft_tp=len(previous.get('draft_gpus',[4,5])),
+                    overlap_target=previous.get('overlap_target',False),
+                    draft_thinking=previous.get('draft_thinking',False),
+                    draft_path=previous.get('draft_path','/home/longyy/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218'))
+    for key, value in defaults.items():
+        if getattr(args,key) is None:
+            setattr(args,key,value)
+    if not 0 < args.draft_tokens < args.draft_context:
+        parser.error('--draft-tokens must be positive and smaller than --draft-context')
+    if previous and args.action == 'restart-proxy':
+        expected = dict(draft_context=previous['draft_context'], draft_tp=len(previous['draft_gpus']),
+                        draft_tokens=previous.get('draft_tokens',2048),
+                        draft_path=previous['draft_path'], overlap_target=previous.get('overlap_target',False),
+                        draft_thinking=previous.get('draft_thinking',False))
+        if any(getattr(args,key) != value for key,value in expected.items()):
+            parser.error('Use a new service directory to change configuration; existing proxy was not stopped')
     if args.action in {'start','restart-proxy'}:
         path.mkdir(parents=True, exist_ok=True)
         with (path/'services.lock').open('a') as lock:

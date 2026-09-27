@@ -11,9 +11,9 @@ import uuid
 import httpx
 
 if __package__:
-    from .proxy import Config, Gate
+    from .proxy import Config, Gate, HeldOutput
 else:
-    from proxy import Config, Gate
+    from proxy import Config, Gate, HeldOutput
 
 
 TOOLS = [dict(type='function', function=dict(name=name, description=description, parameters={
@@ -41,8 +41,8 @@ def state(task, evidence=None):
 
 async def run(args):
     out=Path(args.output).resolve();out.mkdir(parents=True,exist_ok=True)
-    cfg=Config(log_dir=str(out/'probe-internal'))
-    report=dict(kind='controlled_synthetic_probes_not_benchmark_accuracy',cases=[],paired=[])
+    cfg=Config(draft_context=args.draft_context,log_dir=str(out/'probe-internal'))
+    report=dict(kind='controlled_synthetic_probes_not_benchmark_accuracy',overlap_review=args.overlap_review,cases=[],paired=[])
     read_state=state('Inspect src/math.py to explain its current behavior. Do not edit any file or read .env files.')
     edit_state=state('Fix inc(n) to return n + 1 for any integer n. Do not modify tests.',
                      'File /app/src/math.py contains exactly:\ndef inc(n):\n    return n - 1\n')
@@ -65,7 +65,16 @@ async def run(args):
         for name,payload,proposal,expected in cases:
             record=dict(name=name,expected_accept=expected,stages=[])
             start=time.monotonic()
-            accepted=await gate.review_candidate(record,payload,proposal,{})
+            background=None
+            if args.overlap_review:
+                background=asyncio.create_task(gate.target(record,dict(payload,stream=True,return_token_ids=True),{},HeldOutput(asyncio.Queue())))
+                await asyncio.sleep(0)
+            try:
+                accepted=await gate.review_candidate(record,payload,proposal,{})
+            finally:
+                if background is not None:
+                    background.cancel()
+                    await asyncio.gather(background,return_exceptions=True)
             record.update(accepted=accepted,correct=accepted==expected,wall_seconds=time.monotonic()-start)
             report['cases'].append(record)
             print(name,'expected',expected,'accepted',accepted,'seconds',round(record['wall_seconds'],3),flush=True)
@@ -87,7 +96,8 @@ async def run(args):
             (out/'probe.json').write_text(json.dumps(report,indent=2))
         if args.long_context:
             rng=random.Random(20260921)
-            log='\n'.join(f'archived build record {i}: count={rng.randrange(10000000)} status=ok' for i in range(11000))
+            lines=2200 if cfg.draft_context<=32768 else 11000
+            log='\n'.join(f'archived build record {i}: count={rng.randrange(10000000)} status=ok' for i in range(lines))
             payload=state('Inspect src/math.py. The following archived build log is unrelated to the current source; do not edit files.')
             payload['messages'] += [dict(role='assistant',content=None,tool_calls=[dict(id='old_log',type='function',function=dict(name='bash',arguments='{"command":"cat old.log","cwd":"/app"}'))]),
                                     dict(role='tool',tool_call_id='old_log',content=log),
@@ -115,4 +125,6 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',required=True)
     parser.add_argument('--long-context',action='store_true')
+    parser.add_argument('--draft-context',type=int,default=32768)
+    parser.add_argument('--overlap-review',action='store_true')
     asyncio.run(run(parser.parse_args()))

@@ -142,23 +142,30 @@ python3 scripts/pro/pro_test.py init --help
 
 ## 8B 生成、27B 审核的转接口实验
 
-代码在 [scripts/semantic_gate/](scripts/semantic_gate/)，不会改动冻结的 runner 模板。GPU 0–3 部署 Qwen3.8-27B（TP4、BF16、DFlash2、262144 上下文）；GPU 4–5 部署 Qwen3-8B（TP2、BF16、131072 上下文），GPU 6–7 留空。8B 使用固定 revision `b968826d9c46dd6066d109eabc6255188de91218`，通过 YaRN factor=4 扩展窗口；这与其原生短窗口配置有区别，依据 [Qwen3-8B 官方模型说明](https://huggingface.co/Qwen/Qwen3-8B)。
+代码在 [scripts/semantic_gate/](scripts/semantic_gate/)，不会改动冻结的 runner 模板。当前并行实验使用 GPU 0–3 的 Qwen3.8-27B（TP4、BF16、DFlash2、262144 上下文）和 GPU 4–7 的 Qwen3-8B（TP4、BF16、普通解码、32768 上下文，无 YaRN）。8B 固定 revision 为 `b968826d9c46dd6066d109eabc6255188de91218`。旧版 `semantic-gate-20260921` 使用 8B TP2、YaRN 131072 和串行回退，不能直接把两次整题耗时差都归因于 overlap；新脚本提供同配置三组请求重放对照。
 
 ```text
 OpenCode → 原有请求记录代理 → semantic gate :8002
-                              ├─ 历史超出 8B 容量 → 27B 压缩 → 8B 候选
-                              └─ 历史可容纳 → 8B 候选
-                                  ↓ 工具名、JSON Schema、完整性检查
-                              27B 使用完整原始历史审核，只生成 A/R
-                                  ├─ A → 返回候选，OpenCode 执行工具
-                                  └─ R/异常 → 27B 用原始请求生成 → 返回
+                              ├─ 27B 原请求独立生成 → 完整结果就绪即返回 ─────┐
+                              └─ 必要时 27B 压缩 → 8B 候选                 │
+                                  ↓ 工具名、JSON Schema、完整性检查       │
+                              27B 完整历史审核，只生成 A/R                │
+                                  ├─ A → 取消/丢弃后台 27B，返回 8B       │
+                                  └─ R/异常 → 释放已暂存前缀并接续同一生成 ┘
+                              OpenCode 收到选定结果后才执行工具
 ```
 
 8B 默认关闭 thinking，最多生成 2048 token；27B 审核关闭 thinking，并限制为 A/R 的结构化选择、最多 2 token（含结束标记）。审核 prompt 在 [bootstrap/semantic-gate-review.txt](bootstrap/semantic-gate-review.txt)，重点是调用是否为有依据且符合约束的下一步，不要求与 27B 自己会选择的动作完全相同。一次输出的多个工具调用整批接受或拒绝；审核过程不实际执行工具。候选不完整、工具格式错误、审核超时或异常均回退。最终文字答复、标题及其他无工具请求直接使用 27B。
 
+`--draft-thinking` 会为 8B 启用 thinking，并采用 Qwen3 建议的 `temperature=0.6, top_p=0.95, top_k=20, min_p=0`；审核和压缩仍关闭 thinking。用 `--draft-tokens` 指定 reasoning 加工具调用的合计输出上限。2026-09-21 的 thinking fixed10 实验使用 `--draft-tp 4 --draft-context 32768 --draft-tokens 8192 --draft-thinking --overlap-target`，服务目录为 `manual-runs/semantic-thinking-overlap-20260921`，评测目录为其下 `fixed10/`。它与先前 off/greedy/2048 配置不构成仅改变 thinking 开关的消融；返回候选的逻辑 usage 使用 27B tokenizer 估计，并包括返回的 reasoning，物理 token 消耗以 gateway 各阶段的 vLLM usage 为准。
+
+2026-09-22 的 YaRN 对照使用新服务目录 `manual-runs/semantic-yarn-overlap-20260922`，参数为 `--draft-tp 4 --draft-context 131072 --draft-tokens 8192 --draft-thinking --overlap-target`。启动脚本会为长上下文 8B 添加 YaRN factor=4、original_max_position_embeddings=32768。代理自动用 `draft_context - 当前输出预算` 判断是否压缩，8192 输出预算下的输入阈值为 **122880**，无需再改一个固定的 32K 阈值。`paired-pro/` 重跑前两道已有完整结果的 fixed10 任务；`threshold-probe/` 只比较同一 YaRN 后端上的压缩门限，不能当成端到端测试或原生/YaRN 质量比较。
+
 长历史先交给 27B，使用 [压缩 prompt](bootstrap/semantic-gate-compress.txt) 生成工作记忆，仅供 8B 使用。保留原始系统约束、首个用户任务，并尽量保留近期完整工具轮次；若仍放不下，扩大压缩范围。压缩后仍超过容量或压缩未完成则回退。**27B 审核和回退生成始终使用原始完整历史**。同一会话只有在历史前缀完全匹配时才复用已有摘要，避免每轮重复压缩。这个代理内部压缩与 OpenCode 自身的 compaction 分开记录。
 
 这属于语义审核，不能保证与纯 27B 无损等价；接受率不能代替 SWE 官方通过率。能否加速取决于节省的 27B 生成时间是否大于 8B 生成、审核、压缩和失败回退的额外成本。
+
+**竞速返回（first_ready_v2）：27B 的完整结果与审核通过的 8B 候选，谁先就绪就返回谁，取消另一条分支。27B 先完成时，候选、压缩或审核无论进行到哪一步都不再等待。** 拒绝候选则接续同一条 27B 生成。审核和独立生成共享 27B 的四张 GPU，允许 vLLM continuous batching；仍需测量审核对 27B 的算力干扰，竞速策略本身不保证相对独占 GPU 的纯 27B 绝不变慢。8B 默认 thinking=false 是沿用的实验变量，可用 `--draft-thinking` 开启；27B 独立生成保留调用方的 thinking 与采样设置。
 
 ### 启动和检查服务
 
@@ -166,14 +173,15 @@ OpenCode → 原有请求记录代理 → semantic gate :8002
 
 ```bash
 python3 scripts/semantic_gate/services.py start \
-  --output manual-runs/semantic-gate-20260921
+  --output manual-runs/semantic-overlap-20260921 \
+  --draft-tp 4 --draft-context 32768 --overlap-target
 python3 scripts/semantic_gate/services.py status \
-  --output manual-runs/semantic-gate-20260921
+  --output manual-runs/semantic-overlap-20260921
 ```
 
-实际端口为：27B `8000`、8B `8001`、转接口 `8002`；OpenCode 的模型 baseURL 使用 `http://127.0.0.1:8002/v1`。现有 Pro 容器通过原请求记录代理访问转接口，因此隔离网络和 Git 清理流程保留。服务控制脚本会检查 GPU/端口占用，只管理记录了 PID 和进程启动标识的本次服务。start 返回不等于加载完成，应等待三项 health 都通过。
+实际端口为：27B `8000`、8B `8001`、转接口 `8002`；OpenCode 的模型 baseURL 使用 `http://127.0.0.1:8002/v1`。现有 Pro 容器通过原请求记录代理访问转接口，因此隔离网络和 Git 清理流程保留。服务控制脚本会检查 GPU/端口占用，只管理记录了 PID 和进程启动标识的本次服务。start 返回不等于加载完成，应等待三项 health 都通过。`--draft-tp` 可选 1/2/4；`--overlap-target` 开启后台独立生成，不加则沿用串行版本。旧脚本默认值仍为 TP2/131072/串行；上述命令显式覆盖。对已有目录，start/restart-proxy 默认读取保存的配置，改变参数需新目录。
 
-评测工作区位于 OpenCode 源码目录下时，新初始化的 runner 会用空的只读 tmpfs 屏蔽容器内 `/opencode/swe-bench-env`，并在启动模型前确认目录为空，避免源码挂载把题库、评分资料和历史运行一起暴露给 agent。旧运行目录若缺少这项隔离会被拒绝，需重新 init。首轮 `ansible-pilot` 因发现这个挂载问题已终止并标为无效；有效试跑使用 `ansible-pilot-isolated`，不可混用。
+评测工作区位于 OpenCode 源码目录下时，新初始化的 runner 会用空的只读 tmpfs 屏蔽容器内 `/opencode/swe-bench-env`，并在启动模型前确认目录为空，避免源码挂载把题库、评分资料和历史运行一起暴露给 agent。旧运行目录若缺少这项隔离会被拒绝，需重新 init。旧服务目录 `semantic-gate-20260921/ansible-pilot` 因这个挂载问题终止，有效串行试跑为该目录中的 `ansible-pilot-isolated`。`semantic-overlap-20260921/ansible-pilot` 因错误的等待审核策略停止并标记，当前竞速评测为 `ansible-race-v2`，不可混用。
 
 8B 不在缓存时可先下载；代理沿用已有设置，关闭遗留 SOCKS 环境变量以免影响 HTTP 下载：
 
@@ -195,7 +203,7 @@ env -u ALL_PROXY -u all_proxy HF_HUB_DISABLE_XET=1 \
 python3 scripts/pro/pro_test.py init \
   --output manual-runs/my-gated-pro \
   --cohort fixed10 --indices 4 \
-  --gateway-run-dir manual-runs/semantic-gate-20260921
+  --gateway-run-dir manual-runs/semantic-overlap-20260921
 
 sg docker -c 'python3 scripts/pro/pro_test.py doctor --output manual-runs/my-gated-pro'
 sg docker -c 'python3 scripts/pro/pro_test.py pull --output manual-runs/my-gated-pro'
@@ -205,9 +213,9 @@ sg docker -c 'python3 scripts/pro/pro_test.py run --output manual-runs/my-gated-
 此模式不执行 pro_test.py serve 或 run_pro.sh；它们负责普通评测服务。转接口由上述 services.py 单独管理，求解结束后服务保持运行。停止前先让任务结束；停止和只重启转接口的命令如下：
 
 ```bash
-python3 scripts/semantic_gate/services.py stop --output manual-runs/semantic-gate-20260921
+python3 scripts/semantic_gate/services.py stop --output manual-runs/semantic-overlap-20260921
 # 改了转接口代码或 prompt 后，等待当前任务结束，再仅重启它：
-python3 scripts/semantic_gate/services.py restart-proxy --output manual-runs/semantic-gate-20260921
+python3 scripts/semantic_gate/services.py restart-proxy --output manual-runs/semantic-overlap-20260921
 ```
 
 ### 日志、口径和验证
@@ -219,10 +227,15 @@ python3 scripts/semantic_gate/services.py restart-proxy --output manual-runs/sem
 | gateway-logs/requests.jsonl | 每个请求的候选、路由、审核结果、压缩及各物理阶段 usage/服务端时长 |
 | [scripts/semantic_gate/metrics.py](scripts/semantic_gate/metrics.py) | 从物理调用统计候选接受率、审核/压缩成本、各模型 tokens 和 decode TPS |
 | [scripts/semantic_gate/probe.py](scripts/semantic_gate/probe.py) | 可控正反例、短请求配对计时、可选超长上下文压缩检查；不等同于 SWE 通过率测试 |
+| [scripts/semantic_gate/overlap_probe.py](scripts/semantic_gate/overlap_probe.py) | 同一批真实请求前缀对比纯 27B、串行审核、并行审核；检查取消后两个后端队列归零；不执行工具 |
+| [scripts/semantic_gate/thinking_probe.py](scripts/semantic_gate/thinking_probe.py) | 相同请求前缀和采样参数配对比较 8B thinking 开关，附 greedy 基线；重复审核诊断判决波动，不执行工具，不代表 SWE 通过率 |
+| [scripts/semantic_gate/yarn_probe.py](scripts/semantic_gate/yarn_probe.py) | 同一 YaRN 后端配对比较 32K/128K 代理容量门限，区分压缩路径开销；不执行工具，非原生/YaRN 端到端对照 |
+| [scripts/semantic_gate/replay.py](scripts/semantic_gate/replay.py) | 只重放已记录的请求前缀，不执行工具；统计真实工具候选的 TPS，并可测固定 512 输出 token 的长上下文解码 |
+| [scripts/semantic_gate/tp_sweep.py](scripts/semantic_gate/tp_sweep.py) | 使用相同请求和启动参数，顺序测 TP1/TP2/TP4 与 DFlash；专用实验脚本，要求 GPU 4–7 已空闲，每个配置结束后释放自己启动的服务 |
 
 ```bash
 python3 scripts/semantic_gate/metrics.py \
-  manual-runs/semantic-gate-20260921/gateway-logs \
+  manual-runs/semantic-overlap-20260921/gateway-logs \
   --run-dir manual-runs/my-gated-pro \
   --output-dir manual-runs/my-gated-pro/metrics-output
 
@@ -234,7 +247,11 @@ python3 scripts/semantic_gate/metrics.py \
 
 有 gateway 配置的 Pro 运行结束时会自动生成 gateway-metrics.md/json。独立统计省略 run-dir 会统计该服务日志中的全部请求；指定 run-dir 按已结束任务的 agent 时间区间筛选，测试时不要让无关实验同时使用同一服务。
 
+TPS 对照脚本使用原生 32768 上下文，区别于转接口首次试跑的 YaRN 131072 配置。`replay.py --inputs` 接受 JSON 数组，每项包含 `index`、`original_request_id` 和原始 OpenAI 请求 `payload`；只使用该请求已有的历史。用 vLLM 环境的 Python 执行，参数见 `--help`。`tp_sweep.py --base-server` 读取已保存的服务 argv，`--draft` 指向本地 DFlash snapshot，`--inputs` 指向上述请求数组，`--output` 必须是新的实验目录。单卡普通解码基线需先独立运行并保留；sweep 测其余五组。实际启动命令、失败原因、逐请求计时和测量命令均写入输出目录。固定长度探针是合成性能负载，不能据此判断 SWE 解题质量或整题加速比。
+
 接受的候选在审核前不会传给 OpenCode；审核后集中发送 SSE，不能把发送速度当 decode TPS。返回 usage 为原始历史在 27B tokenizer 下的输入计数，加上候选序列化后的输出计数估计，用于维持 OpenCode 的上下文预算；8B、审核、压缩的实际物理 tokens 都在分阶段日志里。gateway-metrics 使用真实后端 generation_time_ms；时间占比先按每个 API 请求等待时间计算，再平均，不包含工具执行。标准 key-metrics 的模型阶段列不能覆盖这个实验全部内部开销，报告会提示使用 gateway-metrics；整题墙钟、工具事件和官方评分仍由原 harness 记录。250 次预算仍按 OpenCode 逻辑请求计数，新增物理请求另外统计。
+
+并行统计会将 `draft+target`、`review+target` 等重叠区间单列，使互斥墙钟占比合计约 100%。阶段活动时间仍保留，但不能相加。后台取消调用只有已收到的 token 下界，缺少完整 usage/metrics 时不计算精确 TPS，也不把取消算作零成本。后端队列归零检查和当前竞速重放明细见 `semantic-overlap-20260921/paired-race-v2/`。旧 `paired-replay/` 使用错误的“27B 先完成仍等审核”策略，已标记 superseded-policy.json，仅保留用于解释修正前的问题。
 
 <a id="environment"></a>
 

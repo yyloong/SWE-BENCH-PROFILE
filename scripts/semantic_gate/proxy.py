@@ -34,6 +34,7 @@ class Config:
     draft_context: int = 131072
     draft_tokens: int = 2048
     draft_thinking: bool = False
+    overlap_target: bool = False
     review_tokens: int = 2
     compress_tokens: int = 4096
     timeout: float = 1800
@@ -48,6 +49,64 @@ class UpstreamError(Exception):
         self.status = status
         self.body = body
         super().__init__(f'Upstream HTTP {status}: {str(body)[:500]}')
+
+
+class HeldOutput:
+    """Hold every target delta until the semantic decision commits one branch."""
+    def __init__(self, output):
+        self.output = output
+        self.chunks = []
+        self.released = False
+
+    async def put(self, chunk):
+        chunk = copy.deepcopy(chunk)
+        # Replayed deltas are not a GPU timing measurement. The original metrics
+        # remain in the physical target stage, including on cancelled branches.
+        chunk.pop('metrics', None)
+        if self.released:
+            await self.output.put(chunk)
+            return
+        self.chunks.append(chunk)
+
+    async def release(self):
+        # Queue is unbounded: putting these chunks cannot interleave with a new
+        # target delta and reorder the prefix relative to the live suffix.
+        for chunk in self.chunks:
+            await self.output.put(chunk)
+        self.chunks.clear()
+        self.released = True
+
+    def completion(self):
+        result = dict(object='chat.completion', choices=[])
+        message = dict(role='assistant', content=None)
+        calls = {}
+        finish = None
+        for chunk in self.chunks:
+            if chunk.get('error'):
+                raise UpstreamError(502, chunk['error'])
+            for key in ['id', 'created', 'model', 'system_fingerprint', 'usage']:
+                if chunk.get(key) is not None:
+                    result[key] = chunk[key]
+            for choice in chunk.get('choices') or []:
+                if choice.get('finish_reason'):
+                    finish = choice['finish_reason']
+                delta = choice.get('delta') or {}
+                for key in ['content', 'reasoning', 'reasoning_content', 'refusal']:
+                    if delta.get(key) is not None:
+                        message[key] = (message.get(key) or '')+delta[key]
+                for call in delta.get('tool_calls') or []:
+                    target = calls.setdefault(call['index'], dict(type='function', function=dict(name='', arguments='')))
+                    for key in ['id', 'type']:
+                        if call.get(key):
+                            target[key] = call[key]
+                    for key in ['name', 'arguments']:
+                        target['function'][key] += (call.get('function') or {}).get(key) or ''
+        if finish is None or 'usage' not in result:
+            raise UpstreamError(502, 'Target stream ended without complete finish and usage')
+        if calls:
+            message['tool_calls'] = [calls[i] for i in sorted(calls)]
+        result['choices'] = [dict(index=0, message=message, finish_reason=finish)]
+        return result
 
 
 def validate_candidate(payload, result):
@@ -123,6 +182,10 @@ class Gate:
 
     async def call(self, record, phase, payload, url, headers, timeout=None):
         stage = dict(phase=phase, started_at=time.time(), model=payload['model'])
+        if phase == 'draft':
+            stage['generation_config'] = {key: payload[key] for key in
+                ['max_tokens', 'temperature', 'top_p', 'top_k', 'min_p', 'seed', 'chat_template_kwargs']
+                if key in payload}
         record['stages'].append(stage)
         start = time.monotonic()
         try:
@@ -132,6 +195,9 @@ class Gate:
             if phase in {'review', 'compress'}:
                 stage['content'] = (result.get('choices') or [{}])[0].get('message', {}).get('content')
             return result
+        except asyncio.CancelledError:
+            stage['cancelled'] = True
+            raise
         except Exception as error:
             stage['error'] = repr(error)
             raise
@@ -153,6 +219,9 @@ class Gate:
 
     async def draft_messages(self, record, payload, headers, draft_limit):
         draft = stage_payload(payload, self.config.draft_model, draft_limit, self.config.draft_thinking)
+        if self.config.draft_thinking:
+            # Qwen3 recommends these settings for thinking; greedy can loop.
+            draft.update(temperature=0.6, top_p=0.95, top_k=20, min_p=0)
         scope = (headers.get('x-pro-session'), payload.get('cache_salt'), digest(payload.get('tools')))
         cached = self.summaries.get(scope)
         if cached and len(payload['messages']) >= cached['prefix_count']:
@@ -235,12 +304,13 @@ class Gate:
         # not the small-model input (which may have been privately summarized).
         target = dict(payload, model=self.config.target_model)
         prompt_tokens = await self.tokenize(target, self.config.target_url, headers)
-        serialized = json.dumps({k: v for k, v in candidate.items() if k in {'content', 'tool_calls'}},
+        serialized = json.dumps({k: v for k, v in candidate.items()
+                                 if k in {'content', 'tool_calls', 'reasoning', 'reasoning_content'}},
                                 ensure_ascii=False)
         count = await self.request(self.config.target_url, '/tokenize',
                                    dict(model=self.config.target_model, prompt=serialized,
                                         add_special_tokens=False), headers)
-        record['returned_usage_basis'] = 'target_prompt_exact_plus_serialized_candidate_tokens'
+        record['returned_usage_basis'] = 'target_prompt_exact_plus_serialized_candidate_including_reasoning_tokens'
         return dict(prompt_tokens=prompt_tokens, completion_tokens=count['count'],
                     total_tokens=prompt_tokens+count['count'])
 
@@ -249,7 +319,8 @@ class Gate:
         target['model'] = self.config.target_model
         if not payload.get('stream'):
             return await self.call(record, 'target', target, self.config.target_url, headers)
-        target['stream_options'] = dict(target.get('stream_options') or {}, include_usage=True)
+        target['stream_options'] = dict(target.get('stream_options') or {}, include_usage=True,
+                                        continuous_usage_stats=True)
         stage = dict(phase='target', model=self.config.target_model, started_at=time.time())
         record['stages'].append(stage)
         start = time.monotonic()
@@ -263,25 +334,66 @@ class Gate:
                         continue
                     text = line[5:].strip()
                     if text == '[DONE]':
+                        stage['stream_done'] = True
                         continue
                     chunk = json.loads(text)
+                    if chunk.get('error'):
+                        raise UpstreamError(502, chunk['error'])
                     if chunk.get('usage'):
                         stage['usage'] = chunk['usage']
                     if chunk.get('metrics'):
                         stage['metrics'] = chunk['metrics']
                     for choice in chunk.get('choices') or []:
+                        if choice.get('token_ids'):
+                            stage['observed_completion_token_ids'] = stage.get('observed_completion_token_ids', 0)+len(choice['token_ids'])
                         delta = choice.get('delta') or {}
                         if any(delta.get(k) for k in ['content', 'reasoning', 'reasoning_content', 'tool_calls']):
                             stage.setdefault('first_delta_at', time.time())
                         if choice.get('finish_reason'):
                             stage['finish_reason'] = choice['finish_reason']
                     await output.put(chunk)
+            if not stage.get('finish_reason'):
+                raise UpstreamError(502, 'Target stream ended before finish_reason')
+            stage['usage_complete'] = bool(stage.get('usage'))
             return None
+        except asyncio.CancelledError:
+            stage['cancelled'] = True
+            stage['usage_complete'] = False
+            raise
         except Exception as error:
             stage['error'] = repr(error)
             raise
         finally:
             stage.update(ended_at=time.time(), wall_seconds=time.monotonic()-start)
+
+    async def propose(self, record, payload, headers):
+        """Return a fully checked candidate, or None; never commit a route here."""
+        try:
+            caller_limit = payload.get('max_completion_tokens') or payload.get('max_tokens') or self.config.draft_tokens
+            limit = min(caller_limit, self.config.draft_tokens)
+            draft = await self.draft_messages(record, payload, headers, limit)
+            response = await self.call(record, 'draft', draft, self.config.draft_url, headers)
+            rejection = validate_candidate(payload, response)
+            record['candidate'] = (response.get('choices') or [{}])[0].get('message')
+            record['local_rejection'] = rejection
+            if rejection or not await self.review_candidate(record, payload, record['candidate'], headers):
+                record['fallback_reason'] = rejection or 'review_rejected'
+                return None
+            response['usage'] = await self.accepted_usage(record, payload, record['candidate'], headers)
+            response['model'] = payload.get('model', self.config.target_model)
+            response['id'] = 'chatcmpl-gate-'+record['id']
+            # Buffered SSE is transport time, not GPU decode time.
+            response.pop('metrics', None)
+            response.pop('prompt_token_ids', None)
+            response['choices'][0].pop('token_ids', None)
+            response['semantic_gate'] = dict(id=record['id'], route='accepted', buffered=True,
+                                            usage_basis=record['returned_usage_basis'])
+            record['proposal_ready_at'] = time.time()
+            record['proposal_ready_monotonic'] = time.monotonic()
+            return response
+        except (httpx.HTTPError, UpstreamError, ValueError, KeyError, TypeError, IndexError) as error:
+            record['fallback_reason'] = repr(error)
+            return None
 
     async def run(self, payload, headers, output):
         record = dict(id=uuid.uuid4().hex, started_at=time.time(), stages=[],
@@ -290,40 +402,75 @@ class Gate:
         start = time.monotonic()
         record['review_prompt_sha256'] = hashlib.sha256(self.review.encode()).hexdigest()
         record['compress_prompt_sha256'] = hashlib.sha256(self.compress.encode()).hexdigest()
+        record['overlap_target'] = self.config.overlap_target
+        record['routing_policy'] = 'first_ready_v2' if self.config.overlap_target else 'serial'
+        record['draft_thinking'] = self.config.draft_thinking
+        target_task = proposal_task = None
         try:
             eligible = (bool(payload.get('tools')) and payload.get('tool_choice') != 'none'
                         and payload.get('n', 1) == 1 and not payload.get('response_format')
                         and headers.get('x-pro-agent') not in {'title', 'compaction', 'summary'})
-            if eligible:
-                try:
-                    caller_limit = payload.get('max_completion_tokens') or payload.get('max_tokens') or self.config.draft_tokens
-                    limit = min(caller_limit, self.config.draft_tokens)
-                    draft = await self.draft_messages(record, payload, headers, limit)
-                    response = await self.call(record, 'draft', draft, self.config.draft_url, headers)
-                    rejection = validate_candidate(payload, response)
-                    record['candidate'] = (response.get('choices') or [{}])[0].get('message')
-                    record['local_rejection'] = rejection
-                    if not rejection and await self.review_candidate(record, payload, record['candidate'], headers):
-                        response['usage'] = await self.accepted_usage(record, payload, record['candidate'], headers)
-                        response['model'] = payload.get('model', self.config.target_model)
-                        response['id'] = 'chatcmpl-gate-'+record['id']
-                        # Buffered delivery cannot be interpreted as GPU decode by
-                        # the ordinary timing analyzer. Physical metrics live in stages.
-                        response.pop('metrics', None)
-                        response.pop('prompt_token_ids', None)
-                        response['choices'][0].pop('token_ids', None)
-                        response['semantic_gate'] = dict(id=record['id'], route='accepted', buffered=True,
-                                                        usage_basis=record['returned_usage_basis'])
-                        record['route'] = 'accepted'
-                        return response
-                    record['fallback_reason'] = rejection or 'review_rejected'
-                except (httpx.HTTPError, UpstreamError, ValueError, KeyError, TypeError, IndexError) as error:
-                    record['fallback_reason'] = repr(error)
+            record['eligible'] = eligible
+            if not eligible:
+                record.update(route='target_only', fallback_reason='ineligible_auxiliary_or_request_shape')
+                return await self.target(record, payload, headers, output)
+            if not self.config.overlap_target:
+                response = await self.propose(record, payload, headers)
+                record['decision_at'] = time.time()
+                record['route'] = 'accepted' if response is not None else 'fallback'
+                if response is not None:
+                    return response
+                return await self.target(record, payload, headers, output)
+
+            held = HeldOutput(output)
+
+            async def generate_target():
+                await self.target(record, dict(payload, stream=True, return_token_ids=True), headers, held)
+                # A failed/truncated transport is never a winning target result.
+                stage = next(s for s in record['stages'] if s['phase']=='target')
+                if not stage.get('usage_complete'):
+                    raise UpstreamError(502, 'Target stream has no complete usage')
+                record['target_ready_at'] = time.time()
+                record['target_ready_monotonic'] = time.monotonic()
+
+            target_task = asyncio.create_task(generate_target())
+            proposal_task = asyncio.create_task(self.propose(record, payload, headers))
+            record['target_launched_at'] = time.time()
+            await asyncio.wait({target_task, proposal_task}, return_when=asyncio.FIRST_COMPLETED)
+            target_ok = target_task.done() and not target_task.cancelled() and target_task.exception() is None
+            # If both became ready in one event-loop iteration, compare readiness
+            # times. A target result wins ties; an error never wins the race.
+            target_first = target_ok and record['target_ready_monotonic'] <= record.get('proposal_ready_monotonic', float('inf'))
+            if target_first:
+                record.update(route='target_won', winner='target', decision_at=time.time(),
+                              background_target_disposition='returned_first',
+                              proposal_disposition='completed_discarded' if proposal_task.done() else 'cancelled')
+                if not proposal_task.done():
+                    record['proposal_cancel_requested_at'] = time.time()
+                    proposal_task.cancel()
+                # Do not wait for a verdict, even if a review is already in flight.
             else:
-                record['fallback_reason'] = 'ineligible_auxiliary_or_request_shape'
-            record['route'] = 'fallback' if eligible else 'target_only'
-            # Never append a rejected proposal, verdict, or compressed history here.
-            return await self.target(record, payload, headers, output)
+                response = await proposal_task
+                if response is not None:
+                    record.update(route='accepted', winner='approved_draft', decision_at=time.time(),
+                                  background_target_disposition='completed_discarded' if target_task.done() else 'cancelled')
+                    if not target_task.done():
+                        record['target_cancel_requested_at'] = time.time()
+                        target_task.cancel()
+                    return response
+                record.update(route='fallback', winner='target', decision_at=time.time(),
+                              background_target_disposition='reused')
+            # A rejected proposal commits to this SAME target request. If it is
+            # still running, release its prefix and forward the live suffix.
+            if payload.get('stream'):
+                await held.release()
+                await target_task
+                return None
+            await target_task
+            response = held.completion()
+            response['semantic_gate'] = dict(id=record['id'], route=record['route'], buffered=True,
+                                            background_target_reused=True, routing_policy=record['routing_policy'])
+            return response
         except asyncio.CancelledError:
             record['cancelled'] = True
             raise
@@ -331,6 +478,13 @@ class Gate:
             record['error'] = repr(error)
             raise
         finally:
+            tasks = [task for task in [target_task, proposal_task] if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                record['loser_cleanup_at'] = time.time()
             record.update(ended_at=time.time(), wall_seconds=time.monotonic()-start)
             self.log(record)
 
@@ -365,7 +519,9 @@ def create_app(config):
         ], return_exceptions=True)
         good = all(isinstance(r, httpx.Response) and r.status_code == 200 for r in responses)
         return JSONResponse(dict(status='ok' if good else 'unhealthy', target=config.target_model,
-                                 draft=config.draft_model, draft_context=config.draft_context),
+                                 draft=config.draft_model, draft_context=config.draft_context,
+                                 overlap_target=config.overlap_target,
+                                 routing_policy='first_ready_v2' if config.overlap_target else 'serial'),
                             status_code=200 if good else 503)
 
     @app.get('/v1/models')
@@ -389,12 +545,21 @@ def create_app(config):
         output = asyncio.Queue()
         gate = app.state.gate
         if not payload.get('stream'):
+            task = asyncio.create_task(gate.run(payload, headers, output))
             try:
-                return JSONResponse(await gate.run(payload, headers, output))
+                while not task.done():
+                    await asyncio.wait({task}, timeout=.25)
+                    if not task.done() and await request.is_disconnected():
+                        return Response(status_code=499)
+                return JSONResponse(await task)
             except UpstreamError as error:
                 return JSONResponse({'error': {'message': str(error.body)}}, status_code=error.status)
             except Exception as error:
                 return JSONResponse({'error': {'message': str(error)}}, status_code=502)
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
         async def generate():
             async def execute():
@@ -439,8 +604,8 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8002)
     for field in Config.__dataclass_fields__.values():
-        if field.name == 'draft_thinking':
-            parser.add_argument('--draft-thinking', action='store_true')
+        if field.type is bool:
+            parser.add_argument('--'+field.name.replace('_', '-'), action='store_true')
         else:
             parser.add_argument('--'+field.name.replace('_', '-'), type=field.type, default=field.default)
     args = vars(parser.parse_args())
