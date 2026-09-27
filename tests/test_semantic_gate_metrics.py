@@ -31,6 +31,22 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(result['requests'],0)
         self.assertEqual(result['exclusive_wall_buckets'],{})
 
+    def test_cli_filters_nested_run_intervals(self):
+        import json, subprocess, sys, tempfile
+        from pathlib import Path
+        from scripts.semantic_gate import metrics
+        with tempfile.TemporaryDirectory() as temp:
+            p=Path(temp);task=p/'batch/details/runs/a';task.mkdir(parents=True)
+            (task/'result.json').write_text(json.dumps(dict(agent_start=10,agent_end=20)))
+            rows=[dict(id=str(start),started_at=start,ended_at=start+2,wall_seconds=2,
+                       route='target_won',stages=[]) for start in [1,12]]
+            (p/'requests.jsonl').write_text('\n'.join(map(json.dumps,rows)))
+            subprocess.run([sys.executable,str(Path(metrics.__file__)),str(p/'requests.jsonl'),
+                            '--run-dir',str(p/'batch'),'--output-dir',str(p/'report')],check=True,capture_output=True)
+            result=json.loads((p/'report/gateway-metrics.json').read_text())
+            self.assertEqual(result['requests'],1)
+            self.assertEqual(result['eligible_requests'],1)
+
 
 if __name__=='__main__':
     unittest.main()

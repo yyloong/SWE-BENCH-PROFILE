@@ -25,6 +25,8 @@ class WorkflowTests(unittest.TestCase):
             context.write_text('Inspect the relevant implementation and tests.\n')
             self.invoke('init','--output',str(p),'--indices','4','--ports','8100',
                 '--context-file',str(context))
+            self.assertEqual({x.name for x in p.iterdir()}, {'details','key-metrics.md'})
+            p=p/'details'
             selected=pro_test.read(p/'selected.json')
             self.assertEqual(len(selected),1)
             self.assertEqual(selected[0]['repo'],'ansible/ansible')
@@ -72,6 +74,7 @@ class WorkflowTests(unittest.TestCase):
             (service/'services.json').write_text(json.dumps(dict(target_gpus=[0,1,2,3],gateway_url='http://127.0.0.1:8002')))
             output=Path(temp)/'run'
             self.invoke('init','--output',str(output),'--indices','4','--gateway-run-dir',str(service))
+            output=pro_test.workdir(output)
             self.assertEqual(pro_test.read(output/'config.json')['gateway_run_dir'],str(service))
             self.assertIn("'--upstream','http://127.0.0.1:8002'",(output/'runner.py').read_text())
             self.assertIn("'--tmpfs','/opencode/swe-bench-env:ro,nosuid,nodev,noexec,size=1m'",(output/'runner.py').read_text())
@@ -110,5 +113,57 @@ class WorkflowTests(unittest.TestCase):
             row=json.loads(output.getvalue())['rows'][0]
             self.assertEqual(row['agent_seconds'],25)
             self.assertEqual(row['state'],'grading')
+
+    def test_new_layout_offline_metrics_and_status(self):
+        from tests.test_key_metrics import fixture, request
+        with tempfile.TemporaryDirectory() as temp:
+            output=Path(temp)/'batch'
+            self.invoke('init','--output',str(output),'--indices','4')
+            internal=pro_test.workdir(output)
+            iid=pro_test.read(internal/'selected.json')[0]['instance_id']
+            fixture(internal/'runs'/iid, [request()])
+            self.invoke('metrics','--output',str(output))
+            self.assertEqual({x.name for x in output.iterdir()}, {'details','key-metrics.md'})
+            self.assertIn('平均 Decode TPS', (output/'key-metrics.md').read_text())
+            self.assertTrue((internal/'metrics-output/key-metrics.json').exists())
+            self.assertTrue((internal/'metrics-output/metrics.md').exists())
+            self.assertEqual(json.loads(self.invoke('status','--output',str(output)))['ended'],1)
+            before=(output/'key-metrics.md').read_bytes()
+            self.invoke('metrics','--output',str(output))
+            self.assertEqual(before,(output/'key-metrics.md').read_bytes())
+
+    def test_organize_preserves_data_links_and_old_metrics(self):
+        import sys
+        from tests.test_key_metrics import fixture, request
+        from scripts.metrics import key_metrics
+        with tempfile.TemporaryDirectory() as temp:
+            p=Path(temp)/'batch';p.mkdir()
+            pro_test.save(p/'config.json',dict(python=sys.executable))
+            pro_test.save(p/'selected.json',[dict(instance_id='case')])
+            fixture(p/'runs/case', [request()])
+            (p/'raw.jsonl').write_text('{"original":"keep exactly"}\n')
+            (p/'selector').symlink_to(p/'runs/case')
+            (p/'key-metrics.md').write_text('existing report\n')
+            before=key_metrics.build_report([p])['groups']['batch']
+            self.invoke('organize','--output',str(p))
+            self.assertEqual({x.name for x in p.iterdir()},{'details','key-metrics.md'})
+            self.assertEqual((p/'details/raw.jsonl').read_text(),'{"original":"keep exactly"}\n')
+            self.assertEqual((p/'details/selector').resolve(),p/'details/runs/case')
+            self.assertEqual(before,key_metrics.build_report([p])['groups']['batch'])
+            self.assertEqual(json.loads(self.invoke('status','--output',str(p)))['ended'],1)
+            self.invoke('organize','--output',str(p))
+
+    def test_organize_refuses_locked_run_and_existing_details(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p=Path(temp)
+            pro_test.save(p/'config.json',{})
+            pro_test.save(p/'selected.json',[])
+            with pro_test.locked(p/'runner.lock'):
+                with self.assertRaises(SystemExit):self.invoke('organize','--output',str(p))
+            self.assertTrue((p/'config.json').exists())
+            self.assertFalse((p/'details').exists())
+            (p/'details').mkdir()
+            with self.assertRaises(SystemExit):self.invoke('organize','--output',str(p))
+            self.assertTrue((p/'config.json').exists())
 
 if __name__=='__main__':unittest.main()

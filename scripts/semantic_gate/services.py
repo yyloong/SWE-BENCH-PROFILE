@@ -8,10 +8,14 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
+if not __package__:
+    sys.path.insert(0, str(ROOT))
+from scripts.pro.paths import resolve_saved_path
 
 
 def start_ticks(pid):
@@ -44,7 +48,7 @@ def health(url):
 
 
 def verify(path):
-    path = Path(path).resolve()
+    path = resolve_saved_path(path)
     cfg = json.loads((path/'services.json').read_text())
     for name in ['server-27b', 'server-8b', 'proxy']:
         record = json.loads((path/(name+'.json')).read_text())
@@ -56,7 +60,7 @@ def verify(path):
 
 
 def start(args):
-    path = Path(args.output).resolve()
+    path = resolve_saved_path(args.output)
     path.mkdir(parents=True, exist_ok=True)
     envinfo = json.loads((ROOT/'.pro-env/environment.json').read_text())
     python = envinfo['vllm_python']
@@ -144,7 +148,7 @@ def main():
     parser.add_argument('--draft-thinking', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--draft-path')
     args = parser.parse_args()
-    path = Path(args.output).resolve()
+    path = resolve_saved_path(args.output)
     previous = json.loads((path/'services.json').read_text()) if (path/'services.json').exists() else {}
     defaults = dict(draft_context=previous.get('draft_context',131072),
                     draft_tokens=previous.get('draft_tokens',2048),

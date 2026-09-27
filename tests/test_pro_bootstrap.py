@@ -125,13 +125,28 @@ class BootstrapTests(unittest.TestCase):
             config['infra-fix']='/custom/infra'
             pro.save(env,config)
             with patch('sys.argv',['pro_test.py','init','--output',str(p/'run'),'--indices','4','--environment-file',str(env)]),contextlib.redirect_stdout(io.StringIO()):pro.main()
-            runner=(p/'run/runner.py').read_text();pull=(p/'run/pull_images.py').read_text()
+            runner=(p/'run/details/runner.py').read_text();pull=(p/'run/details/pull_images.py').read_text()
             self.assertIn("PY='/custom/eval/bin/python'",runner)
             self.assertIn("OFFICIAL=Path('/custom/official')",runner)
             self.assertIn('/custom/opencode:/opencode:ro',runner)
             self.assertIn('/custom/bin/skopeo',pull)
             self.assertNotIn('/home/longyy',runner)
             compile(runner,'runner.py','exec');compile(pull,'pull_images.py','exec')
+
+    def test_resume_new_layout_uses_internal_state_without_starting_models(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output=Path(temp)/'run';p=output/'details';p.mkdir(parents=True)
+            pro.save(p/'config.json',{})
+            pro.save(p/'selected.json',[dict(instance_id='case')])
+            pro.save(p/'one-click-inputs.json',dict(environment_file=str(Path(temp)/'env/environment.json')))
+            (p/'runs/case').mkdir(parents=True)
+            pro.save(p/'runs/case/result.json',{})
+            from argparse import Namespace
+            args=Namespace(output=str(output),resume=True,environment_file=None,install_only=False,prepare_only=False)
+            with patch.object(boot,'docker_access'),patch.object(boot,'setup',return_value=Path(temp)/'env/environment.json'),patch.object(pro,'checks'),patch.object(pro,'pull'),patch.object(pro,'metrics') as metrics,patch.object(boot,'workflow',side_effect=AssertionError('must not start models')):
+                self.assertEqual(boot.execute(args),0)
+            metrics.assert_called_once_with(p)
+            self.assertFalse((output/'one-click.lock').exists())
 
 
 if __name__=='__main__':unittest.main()

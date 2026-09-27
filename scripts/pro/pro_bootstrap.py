@@ -260,6 +260,7 @@ def stop_child(child):
 
 def workflow(p, health_timeout):
     """Own both process groups, drain the current task on SIGINT, always stop serve."""
+    p=pro.workdir(p)
     stop=threading.Event();server=None;runner=None
     previous={s:signal.getsignal(s) for s in [signal.SIGINT,signal.SIGTERM]}
     def interrupt(*_):
@@ -297,7 +298,7 @@ def workflow(p, health_timeout):
             time.sleep(2)
         if runner.returncode:raise RuntimeError(f'Evaluation exited with code {runner.returncode}; see {p}/run.log')
         if server.poll() is not None:raise RuntimeError('Model server exited during evaluation; inspect task outcomes.')
-        log('Efficiency report: '+str(p/'metrics-output/metrics.md'))
+        log('Efficiency report: '+str(pro.output_root(p)/'key-metrics.md'))
         return 130 if stop.is_set() else 0
     finally:
         # Normal signals are handled above. Unexpected exceptions still drain the
@@ -310,13 +311,14 @@ def workflow(p, health_timeout):
 
 
 def execute(args):
-    p=Path(args.output).resolve()
+    p=pro.resolve_saved_path(args.output)
     if args.environment_file:
         raise ValueError('run_pro.sh manages --environment-file; use --env-dir instead.')
     verify_bundle()
     if p.exists() and not args.resume:
         raise ValueError('Output exists. Use --resume for the same inputs, or choose a new --output.')
     if args.resume:
+        p=pro.workdir(p)
         if not (p/'config.json').exists() or not (p/'one-click-inputs.json').exists():
             raise ValueError('--resume requires an output previously created by run_pro.sh.')
         # Continue preparing the environment selected on the first invocation.
@@ -332,6 +334,7 @@ def execute(args):
     args.environment_file=str(manifest)
     if not args.resume:
         pro.init(args)
+        p=pro.workdir(p)
         pro.save(p/'one-click-inputs.json',dict(created_at=time.time(),environment_file=str(manifest)))
     else:
         log('Resume uses frozen configuration/context in '+str(p))

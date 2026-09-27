@@ -26,6 +26,34 @@ def fixture(td, requests, tools=None, sessions=None, start=0, end=10):
 
 
 class KeyMetricsTests(unittest.TestCase):
+    def test_nested_layout_cli_keeps_only_markdown_at_output_root(self):
+        import subprocess, sys
+        with tempfile.TemporaryDirectory() as temp:
+            p=Path(temp)/'batch';out=Path(temp)/'report'
+            q=request();q['usage']['prompt_tokens']=100
+            fixture(p/'details/runs/a',[q])
+            subprocess.run([sys.executable,str(Path(km.__file__)),str(p),'--output-dir',str(out)],check=True,capture_output=True)
+            self.assertEqual({x.name for x in out.iterdir()},{'key-metrics.md','details'})
+            data=json.loads((out/'details/key-metrics.json').read_text())
+            self.assertEqual(data['groups']['batch']['mean_prompt_tokens'],100)
+            self.assertEqual(data['groups']['batch']['mean_response_tokens'],13)
+
+    def test_gateway_report_masks_buffered_model_metrics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p=Path(temp);fixture(p/'details/runs/a',[request()])
+            (p/'details/config.json').write_text(json.dumps(dict(gateway_run_dir='/service')))
+            (p/'details/metrics-output').mkdir()
+            (p/'details/metrics-output/gateway-metrics.json').write_text(json.dumps(dict(
+                acceptance_percent=10,mean_request_seconds=4,phases={
+                    'draft':dict(mean_decode_tps=120,mean_call_seconds=2,mean_completion_tokens=100,
+                                 prompt_tokens=400,usage_covered_calls=2,tps_covered_calls=2,calls=3)},
+                exclusive_wall_buckets={'draft+target':dict(mean_request_time_percent=100)})))
+            text=km.markdown(km.build_report([p]))
+            self.assertIn('平均 Decode TPS（token/s） | N/A',text)
+            self.assertIn('8B 候选 | 120.00',text)
+            self.assertIn('draft+target | 100.00%',text)
+            self.assertNotIn('| Decode | 6.00 秒',text)
+
     def test_pass_rate_uses_same_cohort_and_does_not_invent_missing_grades(self):
         with tempfile.TemporaryDirectory() as temp:
             p = Path(temp)

@@ -39,7 +39,7 @@ class Config:
     compress_tokens: int = 4096
     timeout: float = 1800
     review_timeout: float = 120
-    log_dir: str = 'manual-runs/semantic-gate/logs'
+    log_dir: str = 'manual-runs/details/services/semantic-gate/gateway-logs'
     review_prompt: str = str(ROOT/'bootstrap/semantic-gate-review.txt')
     compress_prompt: str = str(ROOT/'bootstrap/semantic-gate-compress.txt')
 

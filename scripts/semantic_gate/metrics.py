@@ -5,6 +5,11 @@ from collections import Counter
 import json
 from pathlib import Path
 import statistics
+import sys
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.pro.paths import resolve_saved_path
 
 
 def wall_buckets(record):
@@ -73,7 +78,7 @@ def main():
     parser.add_argument('--run-dir',help='Only include request starts within this Pro run task agent intervals')
     parser.add_argument('--output-dir',required=True)
     args=parser.parse_args()
-    path=Path(args.log)
+    path=resolve_saved_path(args.log)
     if path.is_dir():path=path/'requests.jsonl'
     by_id={}
     for line in path.read_text().splitlines():
@@ -83,9 +88,12 @@ def main():
     records=list(by_id.values())
     intervals=[]
     if args.run_dir:
-        if (Path(args.run_dir)/'invalid-experiment.json').exists():
+        run = resolve_saved_path(args.run_dir)
+        if (run/'details/runs').is_dir() or (run/'details/config.json').is_file():
+            run = run/'details'
+        if (run/'invalid-experiment.json').exists():
             raise SystemExit('This run is marked invalid and cannot be reported as evaluation data.')
-        for file in (Path(args.run_dir)/'runs').glob('*/result.json'):
+        for file in (run/'runs').glob('*/result.json'):
             data=json.loads(file.read_text())
             if data.get('agent_start') and data.get('agent_end'):
                 intervals.append((data['agent_start'],data['agent_end']))

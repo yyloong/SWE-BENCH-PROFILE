@@ -20,6 +20,11 @@ import threading
 import time
 import urllib.request
 
+if __package__:
+    from .paths import resolve_saved_path
+else:
+    from paths import resolve_saved_path
+
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = '/home/longyy/anaconda3/envs/swebench-eval/bin/python'
 
@@ -41,6 +46,105 @@ def module(path, name):
     spec.loader.exec_module(obj)
     return obj
 
+def workdir(path):
+    """Accept both the public output directory and legacy flat run directories."""
+    path = resolve_saved_path(path)
+    if (path/'details/config.json').is_file() and not (path/'config.json').exists():
+        return path/'details'
+    return path
+
+def output_root(path):
+    path = workdir(path)
+    return path.parent if path.name == 'details' and (path/'config.json').is_file() else path
+
+def publish_report(path):
+    p = workdir(path)
+    source = p/'metrics-output/key-metrics.md'
+    if not source.exists():
+        return
+    text = source.read_text()
+    data = p/'metrics-output/key-metrics.json'
+    if data.exists():
+        report = read(data)
+        if 'groups' in report:
+            renderer = module(ROOT/'scripts/metrics/key_metrics.py', 'report_renderer')
+            cfg = read(p/'config.json')
+            if cfg.get('gateway_run_dir'):
+                gateway = p/'metrics-output/gateway-metrics.json'
+                for group in report['groups'].values():
+                    group['semantic_gate'] = True
+                    group['gateway_metrics'] = read(gateway) if gateway.exists() else None
+            text = renderer.markdown(report)
+    root = output_root(p)
+    detail = os.path.relpath(p/'metrics-output', root)
+    text += f'\n详细报告与原始统计：[details]({detail}/)。\n'
+    target = root/'key-metrics.md'
+    temp = target.with_suffix('.md.tmp')
+    temp.write_text(text)
+    temp.replace(target)
+
+def organize(path):
+    """Move a stopped legacy run (or a static report folder) without deleting data."""
+    output = Path(path).resolve()
+    p = workdir(output)
+    if p != output:
+        if not (output/'key-metrics.md').exists():
+            publish_report(p)
+        return
+    if (output/'details').exists():
+        if (output/'key-metrics.md').is_file() and set(x.name for x in output.iterdir()) == {'key-metrics.md','details'}:
+            return
+        raise ValueError('details/ already exists; refusing to merge or overwrite files.')
+    batch = (output/'config.json').is_file() and (output/'selected.json').is_file()
+    if not batch and not (output/'key-metrics.md').is_file():
+        raise ValueError('Expected an evaluation run or a static report directory containing key-metrics.md.')
+    if (output/'services.json').exists():
+        raise ValueError('This is a shared model-service directory; organize its evaluation batches instead.')
+    with contextlib.ExitStack() as stack:
+        for name in ['runner.lock','serve.lock','one-click.lock']:
+            if batch:
+                stack.enter_context(locked(output/name))
+        records = list(output.glob('*-process.json')) + list(output.glob('server-*.json')) + [output/'serve-supervisor.json']
+        for record in records:
+            if not record.is_file():
+                continue
+            data = read(record)
+            pid = data.get('pid') if isinstance(data,dict) else None
+            cmdline = Path(f'/proc/{pid}/cmdline')
+            if pid and cmdline.exists():
+                command_line = cmdline.read_bytes()
+                if str(output).encode() in command_line or b'vllm' in command_line:
+                    raise RuntimeError(f'Run may still be active (PID {pid}); stop it before organizing.')
+        children = [x for x in output.iterdir() if x.name != 'key-metrics.md']
+        detail = output/'details'
+        detail.mkdir()
+        moved = []
+        try:
+            for child in children:
+                child.rename(detail/child.name)
+                moved.append(child.name)
+        except OSError:
+            for name in reversed(moved):
+                (detail/name).rename(output/name)
+            detail.rmdir()
+            raise
+        # Archived cohort selectors sometimes contain absolute links into runs/.
+        for link in detail.rglob('*'):
+            if link.is_symlink():
+                target = link.readlink()
+                if target.is_absolute() and target.is_relative_to(output) and not target.is_relative_to(detail):
+                    destination = detail/target.relative_to(output)
+                    link.unlink()
+                    link.symlink_to(destination)
+        if batch:
+            if (detail/'invalid-experiment.json').exists():
+                (output/'key-metrics.md').write_text('# 实验无效\n\n该批次已标记无效，不纳入效率或通过率比较。原因见 [记录](details/invalid-experiment.json)。\n')
+            else:
+                publish_report(detail)
+                if not (output/'key-metrics.md').exists():
+                    (output/'key-metrics.md').write_text('# 核心效率指标\n\n尚无可用汇总，原始记录已保留在 [details/](details/)。\n')
+    print(f'Organized {output}: key-metrics.md + details/. No source logs were deleted.')
+
 @contextlib.contextmanager
 def locked(path):
     with path.open('a') as stream:
@@ -51,9 +155,10 @@ def locked(path):
         yield
 
 def init(args):
-    p = Path(args.output).resolve()
-    if p.exists():
+    output = resolve_saved_path(args.output)
+    if output.exists():
         raise ValueError('Output directory already exists. Use a NEW directory; old results are never overwritten by init.')
+    p = output/'details'
     manifest = Path(getattr(args, 'environment_file', None) or ROOT/'.pro-env/environment.json')
     if not manifest.is_file():
         raise ValueError('Prepared environment manifest missing. Run run_pro.sh first, or supply --environment-file.')
@@ -106,7 +211,7 @@ def init(args):
         prompt = ''
     gateway = None
     if getattr(args, 'gateway_run_dir', None):
-        gateway_path = Path(args.gateway_run_dir).resolve()
+        gateway_path = resolve_saved_path(args.gateway_run_dir)
         gateway = read(gateway_path/'services.json')
         if len(ports) != 1 or gpus != [gateway['target_gpus']]:
             raise ValueError('A semantic-gate experiment uses one task queue and the target GPU group.')
@@ -117,6 +222,7 @@ def init(args):
         'port=8000+server': "port=json.loads((P/'config.json').read_text())['ports'][server]",
         "'pathctx-'+P.name+'-grade-'": "'procli-'+hashlib.sha256(str(P).encode()).hexdigest()[:8]+'-grade-'",
         "'pathctx-'+P.name+'-agent-'": "'procli-'+hashlib.sha256(str(P).encode()).hexdigest()[:8]+'-agent-'",
+        "result['experiment_arm']=P.name": "result['experiment_arm']=P.parent.name",
         "  if P.name=='path':\n   planfile=P.parent.parent/'plans'/f\"{d['experiment_index']:02d}.md\"":
             "  planfile=P/'contexts'/(iid+'.md')\n  if planfile.exists():",
     }
@@ -202,13 +308,15 @@ def init(args):
     save(p/'server-templates.json', servers)
     save(p/'input-hashes.json', {str(f.relative_to(p)): hashlib.sha256(f.read_bytes()).hexdigest()
         for f in list(p.glob('*.py'))+list(p.glob('*.ts'))+list(p.glob('*.json'))+list((p/'contexts').glob('*.md'))+[p/'delegation-prompt.txt']})
-    print(f'Created {p}: {len(chosen)} tasks, ports {ports}. No inference or download started.')
+    (output/'key-metrics.md').write_text('# 核心效率指标\n\n已初始化，尚无已完成任务的统计。\n\n运行结束后自动更新本文件；配置、日志与逐题记录位于 [details/](details/)。\n')
+    print(f'Created {output}: {len(chosen)} tasks, ports {ports}. Internal files: {p}. No inference or download started.')
 
 def image_ready(d):
     result = subprocess.run(['docker','image','inspect','jefzda/sweap-images:'+d['dockerhub_tag']],capture_output=True,text=True)
     return result.returncode == 0
 
 def checks(p, require_images=False):
+    p = workdir(p)
     cfg = read(p/'config.json')
     try:
         relative_workspace = ROOT.relative_to(Path(cfg['opencode_root']).resolve())
@@ -230,6 +338,7 @@ def read_json_command(argv):
     return json.loads(command(argv,capture_output=True).stdout)
 
 def pull(p):
+    p = workdir(p)
     command(['docker','info'],capture_output=True)
     downloader=module(p/'pull_images.py','manual_pull')
     for d in read(p/'selected.json'):
@@ -252,6 +361,7 @@ def gpu_guard(cfg):
             except OSError:raise RuntimeError(f'Port {port} is occupied. Choose another free port/GPU group or wait for the owner to finish.')
 
 def serve(p):
+    p = workdir(p)
     cfg=read(p/'config.json')
     if cfg.get('gateway_run_dir'):
         raise RuntimeError('This run uses the semantic gate; manage services with scripts/semantic_gate/services.py.')
@@ -287,6 +397,7 @@ def serve(p):
             save(p/'servers-stopped.json',dict(at=time.time()))
 
 def verify_servers(p):
+    p = workdir(p)
     cfg=read(p/'config.json')
     if cfg.get('gateway_run_dir'):
         controller=module(ROOT/'scripts/semantic_gate/services.py','semantic_gate_services')
@@ -302,24 +413,34 @@ def verify_servers(p):
         urllib.request.urlopen(f'http://127.0.0.1:{port}/health',timeout=5).close()
 
 def metrics(p):
+    p = workdir(p)
     if (p/'invalid-experiment.json').exists():
         raise RuntimeError('This run is marked invalid; do not include it in evaluation metrics.')
     python=read(p/'config.json')['python'] if (p/'config.json').exists() else PYTHON
     if (p/'efficiency_metrics.py').exists():
         command([python,str(p/'efficiency_metrics.py'),str(p),'--output-dir',str(p/'metrics-output')], stdout=subprocess.DEVNULL)
     compact=p/'key_metrics.py' if (p/'key_metrics.py').exists() else ROOT/'scripts/metrics/key_metrics.py'
-    command([python,str(compact),str(p),'--output-dir',str(p/'metrics-output')])
+    argv = [python,str(compact),str(p),'--output-dir',str(p/'metrics-output')]
+    if '--flat-output' in compact.read_text():
+        argv.append('--flat-output')
+    command(argv, stdout=subprocess.DEVNULL)
     cfg=read(p/'config.json') if (p/'config.json').exists() else {}
     if cfg.get('gateway_run_dir'):
-        log=Path(cfg['gateway_run_dir'])/'gateway-logs/requests.jsonl'
+        log=resolve_saved_path(cfg['gateway_run_dir'])/'gateway-logs/requests.jsonl'
         if log.exists():
             command([python,str(ROOT/'scripts/semantic_gate/metrics.py'),str(log),'--run-dir',str(p),
                      '--output-dir',str(p/'metrics-output')])
             report=p/'metrics-output/key-metrics.md'
             if report.exists():
                 report.write_text('> 此实验使用 semantic gate。下表的模型阶段列不包含完整的 8B/审核/压缩开销，请同时查看 gateway-metrics.md；工具墙钟与官方评分仍可参考。\n\n'+report.read_text())
+    publish_report(p)
+    report = output_root(p)/'key-metrics.md'
+    if report.exists():
+        print(report.read_text(), end='')
+        print(f'Report: {report}')
 
 def run(p):
+    p = workdir(p)
     with locked(p/'runner.lock'):
         print(json.dumps(checks(p,require_images=True)),flush=True)
         for key in ['NO_PROXY','no_proxy']:
@@ -349,6 +470,7 @@ def run(p):
         print('Run ended. Model services remain in the serve terminal; stop them with Ctrl-C when finished.')
 
 def status(p):
+    p = workdir(p)
     if (p/'invalid-experiment.json').exists():
         print(json.dumps(read(p/'invalid-experiment.json'),ensure_ascii=False,indent=2))
         return
@@ -390,7 +512,7 @@ def main():
     sub=parser.add_subparsers(dest='action',required=True)
     make=sub.add_parser('init',help='Create a new isolated output directory, without running or downloading anything.')
     init_arguments(make)
-    for action in ['doctor','pull','serve','run','status','metrics']:
+    for action in ['doctor','pull','serve','run','status','metrics','organize']:
         cmd=sub.add_parser(action)
         cmd.add_argument('--output',required=True)
     args=parser.parse_args()

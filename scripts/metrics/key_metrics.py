@@ -216,6 +216,7 @@ def task_metrics(td, result, prefill_field):
 
     quality = Counter()
     tokens_after_first, generation_seconds = 0, 0.0
+    prompt_tokens, response_tokens = 0, 0
     for q in requests:
         if is_child(q):
             continue
@@ -226,6 +227,13 @@ def task_metrics(td, result, prefill_field):
             continue
         quality['parent_requests'] += 1
         metrics, usage = q.get('metrics') or {}, q.get('usage') or {}
+        if (not q.get('in_progress') and a >= start and b <= end and
+                number(usage.get('prompt_tokens')) and number(usage.get('completion_tokens'))):
+            prompt_tokens += usage['prompt_tokens']
+            response_tokens += usage['completion_tokens']
+            quality['token_counted_requests'] += 1
+        else:
+            quality['missing_token_requests'] += 1
         decode_ms = metrics.get('generation_time_ms')
         # Prefer an explicit prefill field if a newer exporter provides it.
         prefill_ms = metrics.get('prefill_time_ms', metrics.get(prefill_field))
@@ -277,10 +285,14 @@ def task_metrics(td, result, prefill_field):
                 tool_parallel_bound=tool_parallel_bound(
                     parent_tool_jobs(tools, child_spans, children, sessions, end), start, end),
                 decode_tps=tokens_after_first/generation_seconds if generation_seconds else None,
+                prompt_tokens=prompt_tokens if quality['token_counted_requests'] else None,
+                response_tokens=response_tokens if quality['token_counted_requests'] else None,
                 cross_category_overlap_seconds=overlap, quality=dict(quality))
 
 
 def candidates(root):
+    if (root/'details/runs').is_dir() or (root/'details/selected.json').is_file():
+        root = root/'details'
     if (root / 'result.json').exists():
         return [root]
     runs = root / 'runs' if (root / 'runs').is_dir() else root
@@ -320,13 +332,22 @@ def campaign(root, exclude_censored=False, prefill_field='time_to_first_token_ms
     tps = [r['decode_tps'] for r in rows if r['decode_tps'] is not None]
     graded = sum(r['grade_known'] for r in rows)
     passed = sum(r['passed'] for r in rows)
-    return dict(input=str(root), tasks=len(rows), tps_tasks=len(tps), excluded=dict(excluded),
+    result = dict(input=str(root), tasks=len(rows), tps_tasks=len(tps), excluded=dict(excluded),
                 graded_tasks=graded, passed=passed,
                 pass_rate_percent=100*passed/len(rows) if graded == len(rows) else None,
                 mean_wall_seconds=mean([r['wall_seconds'] for r in rows]), mean_decode_tps=mean(tps),
+                mean_prompt_tokens=mean([r['prompt_tokens'] for r in rows if r['prompt_tokens'] is not None]),
+                mean_response_tokens=mean([r['response_tokens'] for r in rows if r['response_tokens'] is not None]),
+                token_tasks=sum(r['prompt_tokens'] is not None for r in rows),
                 mean_seconds={k: mean([r['seconds'][k] for r in rows]) for k in rows[0]['seconds']},
                 mean_percent=percentages, quality=dict(quality),
                 tool_parallel_bound=mean_tool_parallel_bound([r['tool_parallel_bound'] for r in rows]))
+    internal = root/'details' if (root/'details/config.json').is_file() else root
+    if (internal/'config.json').is_file() and load(internal/'config.json').get('gateway_run_dir'):
+        result['semantic_gate'] = True
+        path = internal/'metrics-output/gateway-metrics.json'
+        result['gateway_metrics'] = load(path) if path.exists() else None
+    return result
 
 
 def expand_roots(paths):
@@ -335,7 +356,7 @@ def expand_roots(paths):
         root = path.resolve()
         arms = root / 'arms'
         if arms.is_dir():
-            roots.extend(sorted(p for p in arms.iterdir() if (p / 'runs').is_dir()))
+            roots.extend(sorted(p for p in arms.iterdir() if (p/'runs').is_dir() or (p/'details/runs').is_dir()))
         else:
             roots.append(root)
     if len(set(roots)) != len(roots):
@@ -345,7 +366,7 @@ def expand_roots(paths):
 
 def build_report(paths, exclude_censored=False, prefill_field='time_to_first_token_ms'):
     roots = expand_roots(paths)
-    labels = [r.parent.name if r.name == 'runs' else r.name for r in roots]
+    labels = [r.parent.name if r.name in ('runs', 'details') else r.name for r in roots]
     if len(set(labels)) != len(labels):
         labels = list(map(str, roots))
     return dict(schema_version=2, averaging='arithmetic mean over tasks; task TPS uses matched token/time sums; tool parallel bound percentage is a ratio of means',
@@ -370,17 +391,43 @@ def markdown(report):
         lines.append('| ' + label + ' | ' + ' | '.join(values) + ' |')
     row('通过率', [f'{g["pass_rate_percent"]:.2f}%' if g['pass_rate_percent'] is not None else 'N/A（评分未齐）' for g in groups.values()])
     row('平均求解时间（秒/题）', [fmt(g['mean_wall_seconds']) for g in groups.values()])
-    row('平均 Decode TPS（token/s）', [fmt(g['mean_decode_tps']) for g in groups.values()])
+    row('平均已记录 Prompt tokens（主级逻辑请求/题）', [fmt(g.get('mean_prompt_tokens')) for g in groups.values()])
+    row('平均已记录 Response tokens（主级逻辑请求/题）', [fmt(g.get('mean_response_tokens')) for g in groups.values()])
+    row('平均 Decode TPS（token/s）', ['N/A（见下方物理指标）' if g.get('semantic_gate') else fmt(g['mean_decode_tps']) for g in groups.values()])
     for label, key in [('Decode', 'decode'), ('Decode：reasoning', 'reasoning'),
                        ('Decode：非 reasoning', 'non_reasoning'), ('Prefill', 'prefill'),
                        ('工具执行', 'tools'), ('工具：普通工具', 'ordinary_tool'),
                        ('工具：subagent', 'subagent'), ('其余（含跨类重叠）', 'other')]:
-        row(label, [f'{g["mean_seconds"][key]:,.2f} 秒 / {g["mean_percent"][key]:.2f}%' for g in groups.values()])
+        row(label, ['N/A（未完整拆分）' if g.get('semantic_gate') and key in ('decode','reasoning','non_reasoning','prefill','other')
+                    else f'{g["mean_seconds"][key]:,.2f} 秒 / {g["mean_percent"][key]:.2f}%' for g in groups.values()])
     lines += ['', '通过率 = 官方评分通过题数 / 本表纳入的求解题数；评分未齐或有评分环境失败时标为 N/A，不把未知评分当作未通过。',
               '', '各阶段展示「平均秒/题 / 平均占比」。先算每题占比、每题 TPS，再对题目等权平均；不是累计秒数的比例，也不是逐请求 TPS 平均。',
               '', 'Decode + Prefill + 工具执行 + 其余 = 100%。子行已包含在父行；不同细分类同时活跃的区间归入其余，同类并发取并集。',
               '', '模型指标仅统计非子会话请求（含 title/compaction）；subagent 按完整观测生命周期计为工具，内部模型与工具不重复计入。非 reasoning 包含可见文本和工具参数。',
+              '', '逻辑 tokens 为完整落在任务内、已结束且有 usage 的主级请求计数之和，再按有效题目取均值；重复输入上下文会重复计数。缺失/中断请求不补零，覆盖不足时只是已记录部分；转接口的逻辑计数不代表后端物理消耗。',
               '', 'Prefill 使用服务端 scheduled→first-token 时长，不含队列等待；阶段位置按请求结束时间对齐，reasoning 分界按流式边界估算。其余还包括排队、传输、编排等待及无法归因的时间。']
+    for name, g in groups.items():
+        if not g.get('semantic_gate'):
+            continue
+        lines += ['', f'### {name}：转接口物理指标', '',
+                  '转接口缓冲输出，整题 Decode/Prefill/reasoning/其余未完整拆分，上表对应值标为 N/A，不能套用直连的 100% 分区。工具行仍为现有逻辑轨迹的独占区间估计。']
+        gateway = g.get('gateway_metrics')
+        if not gateway:
+            lines += ['', '缺少 gateway 物理调用统计，不能从集中发送 SSE 的速度推算 TPS。']
+            continue
+        lines += ['', f'8B 采用率：{fmt(gateway.get("acceptance_percent"))}%（accepted / eligible）；平均 API 请求等待：{fmt(gateway.get("mean_request_seconds"))} 秒。', '',
+                  '| 阶段 | 平均 Decode TPS | 平均调用秒 | 平均 Prompt tokens | 平均 Response tokens | usage / TPS 完整调用覆盖 |',
+                  '|---|---:|---:|---:|---:|---|']
+        for phase, label in [('draft','8B 候选'),('target','27B 独立生成'),('review','27B 审核'),('compress','27B 压缩')]:
+            p = gateway['phases'].get(phase, {})
+            covered = p.get('usage_covered_calls', 0)
+            prompt = p.get('prompt_tokens', 0)/covered if covered else None
+            lines.append(f'| {label} | {fmt(p.get("mean_decode_tps"))} | {fmt(p.get("mean_call_seconds"))} | {fmt(prompt)} | {fmt(p.get("mean_completion_tokens"))} | {covered} / {p.get("tps_covered_calls",0)}（共 {p.get("calls",0)} 次） |')
+        lines += ['', '此表是逐物理调用均值，tokens/TPS 仅使用完整计数；已取消调用不是零成本。各调用时间可重叠，不能相加当作整题时间。', '',
+                  '| API 请求等待区间（互斥） | 平均占比 |', '|---|---:|']
+        for label, bucket in gateway.get('exclusive_wall_buckets', {}).items():
+            lines.append(f'| {label} | {fmt(bucket.get("mean_request_time_percent"))}% |')
+        lines += ['', '上表分母为每个 API 请求等待时间，先逐请求计算再平均；不含工具，不是 agent 整题墙钟占比。']
     lines += ['', '工具并行优化的理想上界估计（含 subagent，时间均为平均秒/题）：', '',
               '| 指标 | ' + ' | '.join(groups) + ' |', '|---|' + '---:|' * len(groups)]
     for label, key in [('当前工具活跃时间（并集）', 'mean_tool_union_seconds'),
@@ -402,10 +449,10 @@ def markdown(report):
     for name, g in groups.items():
         q = g['quality']
         missing = {k: q[k] for k in ('unattributed_timing_requests', 'invalid_timing_requests',
-                   'missing_prefill_requests', 'unknown_decode_split_requests', 'phase_duration_fallback_requests') if q.get(k)}
+                   'missing_prefill_requests', 'unknown_decode_split_requests', 'phase_duration_fallback_requests', 'missing_token_requests') if q.get(k)}
         if missing or g['excluded'] or g['tps_tasks'] != g['tasks'] or g['graded_tasks'] != g['tasks']:
             lines += ['', f'{name} 数据覆盖：有效评分 {g["graded_tasks"]}/{g["tasks"]} 题，已确认通过 {g["passed"]} 题；TPS {g["tps_tasks"]}/{g["tasks"]} 题；'
-                      f'计时缺口 {json.dumps(missing, ensure_ascii=False)}；排除 {json.dumps(g["excluded"], ensure_ascii=False)}。']
+                      f'tokens {g.get("token_tasks", "未记录")}/{g["tasks"]} 题；计时/计数缺口 {json.dumps(missing, ensure_ascii=False)}；排除 {json.dumps(g["excluded"], ensure_ascii=False)}。']
     return '\n'.join(lines) + '\n'
 
 
@@ -413,6 +460,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('directories', nargs='*', type=Path, default=[Path.cwd()])
     parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--flat-output', action='store_true', help='Internal/legacy use: keep JSON beside Markdown instead of under details/')
     parser.add_argument('--exclude-censored', action='store_true')
     parser.add_argument('--prefill-field', default='time_to_first_token_ms',
                         help='This project exports prefill under time_to_first_token_ms; use prefill_time_ms for other exporters')
@@ -423,7 +471,9 @@ def main():
         if args.output_dir:
             args.output_dir.mkdir(parents=True, exist_ok=True)
             for name, content in [('key-metrics.md', text), ('key-metrics.json', json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)+'\n')]:
-                path = args.output_dir / name
+                folder = args.output_dir if name.endswith('.md') or args.flat_output else args.output_dir/'details'
+                folder.mkdir(exist_ok=True)
+                path = folder / name
                 tmp = path.with_suffix(path.suffix + '.tmp')
                 tmp.write_text(content)
                 tmp.replace(path)
